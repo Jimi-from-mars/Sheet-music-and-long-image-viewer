@@ -19,7 +19,7 @@
 2. 下载编译好的文件，直接运行。目前只有Windows版本。
 
 ## 界面展示
-![image](/assets/screenshot.png)
+![image](assets/screenshot.png)
 
 ## 开发计划
 - 增加查找功能
