@@ -19,7 +19,7 @@
 2. 下载编译好的文件，直接运行。目前只有Windows版本。
 
 ## 界面展示
-![image](https://github.com/user-attachments/assets/c1c4bb3b-b53b-4322-abb4-db53ae8de645)
+![image](/assets/screenshot.png)
 
 ## 开发计划
 - 增加查找功能
