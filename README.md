@@ -1,9 +1,9 @@
-# Sheet Music and Long Image Viewer （长图浏览器）
+# Sheet Music and Long Image Viewer （乐谱/长图浏览器）
 
 **Version: 1.0**
 
 ## 简介
-**Sheet Music and Long Image Viewer（长图浏览器）** 是一款专为浏览长图片（如乐谱、漫画、海报等）设计的工具。  
+**Sheet Music and Long Image Viewer（乐谱/长图浏览器）** 是一款专为浏览长图片（如乐谱、漫画、海报等）设计的工具。  
 它能够将超长的图像按设定的宽度切割，并在多个页面并排展示，适用于演奏、超宽屏浏览等场景，提升查看长图的体验。
 
 ## 特性
@@ -14,9 +14,22 @@
 - 支持多种常见图片格式（JPG, PNG, BMP等）
 - 适配超宽屏显示器与演奏用二屏扩展模式
 
-## 使用方法
-1. 下载代码到本地，在python环境中运行。或者
-2. 下载编译好的文件，直接运行。目前只有Windows版本。
+## 下载与使用
+- 你可以在 [Releases 页面](https://github.com/Jimi-from-mars/Sheet-music-and-long-image-viewer/releases/latest) 下载最新版本的**编译程序（Windows版）**，无需安装，解压后直接运行。
+- 岛主为大家准备了新手乐谱资源包，可在[岛主博客](https://phuketlord.top/archives/19.html)免费下载。解压后与本软件放在同一文件夹内即可（放其他任何地方也没有问题）。
+- 如果希望参与热火朝天的讨论，可加入[电吹管讨论群](https://t.me/+qKoZM2j2JyQ0NGI9)。
+
+### 运行方式
+- **方式一**：下载编译版（推荐，适合普通用户）
+- **方式二**：克隆本仓库，在本地 Python 环境中运行源代码
+
+## 版本更新日志
+
+### v1.0
+- 初版发布
+- 支持超长图像分页浏览
+- 支持图像缩放与拖拽
+- 提供 Windows 版本可执行文件
 
 ## 界面展示
 ![image](assets/sreenshot.png)
