@@ -6,6 +6,8 @@ import json
 import winreg
 import threading
 import time
+import queue
+import ctypes
 
 class ImageViewer:
     def __init__(self, root):
@@ -24,7 +26,9 @@ class ImageViewer:
             'TREE_WIDTH': 'TreeWidth',
             'MASK_STATE': 'MaskEnabled',
             'FAVORITES': 'Favorites',
-            'FAVORITES_POS': 'FavoritesManagerPos'
+            'FAVORITES_POS': 'FavoritesManagerPos',
+            'SEARCH_RESULTS_SIZE': 'SearchResultsSize',
+            'SEARCH_RESULTS_POSITION': 'SearchResultsPosition'
         }
         
         # 添加遮罩控制变量，并从配置文件加载上次的状态
@@ -34,6 +38,21 @@ class ImageViewer:
             self.show_mask.set(bool(int(config.get(self.CONFIG_KEYS['MASK_STATE'], '0'))))
         except:
             self.show_mask.set(False)
+
+        # 搜索功能状态。文件扫描放在线程中执行，避免搜索大量子文件夹时界面卡死。
+        self.search_query = tk.StringVar()
+        self.search_subfolders = tk.BooleanVar(value=False)
+        self.search_status = tk.StringVar(value="尚未开始搜索")
+        self.search_stop_event = threading.Event()
+        self.search_thread = None
+        self.search_result_queue = None
+        self.search_results_window = None
+        self.search_results_listbox = None
+        self.search_result_paths = []
+        self.search_poll_job = None
+        self.search_size_save_job = None
+        self.search_generation = 0
+        self.search_result_count = 0
         
         # 创建菜单栏
         self.create_menu()
@@ -105,7 +124,11 @@ class ImageViewer:
         self.canvas.pack(side='top', fill='both', expand=True)
         
         # 水平滚动条
-        self.scrollbar = tk.Scrollbar(self.right_frame, orient='horizontal', command=self.canvas.xview)
+        self.scrollbar = tk.Scrollbar(
+            self.right_frame,
+            orient='horizontal',
+            command=self.on_horizontal_scroll
+        )
         self.scrollbar.pack(side='bottom', fill='x')
         self.canvas.configure(xscrollcommand=self.scrollbar.set)
         
@@ -113,6 +136,29 @@ class ImageViewer:
         self.current_image = None
         self.scale = 1.0
         self.current_directory = None  # 初始化当前目录
+
+        # 分页按需渲染状态：Pillow 在线程中缩放，Tk 图片仅在主线程中创建。
+        self.render_generation = 0
+        self.lazy_render_context = None
+        self.lazy_render_task_queue = queue.PriorityQueue()
+        self.lazy_render_result_queue = queue.Queue()
+        self.lazy_render_stop_event = threading.Event()
+        self.lazy_render_thread = None
+        self.lazy_render_poll_job = None
+        self.lazy_view_request_job = None
+        self.deferred_render_job = None
+        self.zoom_render_job = None
+        self.lazy_task_sequence = 0
+        self.lazy_page_items = {}
+        self.lazy_page_placeholders = {}
+        self.lazy_page_images = {}
+        self.lazy_page_request_ids = {}
+        self.lazy_page_request_priorities = {}
+        self.lazy_needed_pages = set()
+        self.lazy_failed_pages = set()
+        self.lazy_prefetch_count = 2
+        self.photo_images = []
+        self.start_lazy_render_worker()
         
         # 加载上次访问的目录
         self.load_last_directory()
@@ -163,31 +209,521 @@ class ImageViewer:
     
     def create_menu(self):
         """创建菜单栏"""
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
+        # Tk 原生菜单不能直接放置文本框和普通按钮，因此使用顶部自定义菜单栏，
+        # 既保留原有菜单，也让搜索控件真正位于同一栏中。
+        self.menu_bar = tk.Frame(self.root, relief=tk.RAISED, borderwidth=1)
+        self.menu_bar.pack(side='top', fill='x')
         
         # 创建收藏夹菜单
-        self.favorites_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="收藏夹", menu=self.favorites_menu)
+        favorites_button = tk.Menubutton(
+            self.menu_bar, text="收藏夹", relief=tk.FLAT, padx=8, pady=3
+        )
+        favorites_button.pack(side='left')
+        self.favorites_menu = tk.Menu(favorites_button, tearoff=0)
+        favorites_button.configure(menu=self.favorites_menu)
         self.favorites_menu.add_command(label="整理收藏夹", command=self.show_favorites_manager)
         
         # 创建排序菜单
-        sort_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="排序", menu=sort_menu)
+        sort_button = tk.Menubutton(
+            self.menu_bar, text="排序", relief=tk.FLAT, padx=8, pady=3
+        )
+        sort_button.pack(side='left')
+        sort_menu = tk.Menu(sort_button, tearoff=0)
+        sort_button.configure(menu=sort_menu)
         sort_menu.add_command(label="时间倒序", command=lambda: self.sort_files("time_desc"))
         sort_menu.add_command(label="时间顺序", command=lambda: self.sort_files("time_asc"))
         sort_menu.add_command(label="名称倒序", command=lambda: self.sort_files("name_desc"))
         sort_menu.add_command(label="名称顺序", command=lambda: self.sort_files("name_asc"))
         
         # 添加遮罩选项
-        menubar.add_checkbutton(label="遮罩", variable=self.show_mask, 
-                              command=self.refresh_image)
+        tk.Checkbutton(
+            self.menu_bar,
+            text="遮罩",
+            variable=self.show_mask,
+            command=self.refresh_image,
+            relief=tk.FLAT,
+            padx=8
+        ).pack(side='left')
         
         # 添加帮助菜单
-        menubar.add_command(label="帮助", command=self.show_help)
+        tk.Button(
+            self.menu_bar,
+            text="帮助",
+            command=self.show_help,
+            relief=tk.FLAT,
+            padx=8,
+            pady=3
+        ).pack(side='left')
+
+        ttk.Separator(self.menu_bar, orient=tk.VERTICAL).pack(
+            side='left', fill='y', padx=6, pady=3
+        )
+
+        # 搜索控件
+        tk.Label(self.menu_bar, text="搜索：").pack(side='left')
+        self.search_entry = tk.Entry(
+            self.menu_bar, textvariable=self.search_query, width=32
+        )
+        self.search_entry.pack(side='left', padx=(0, 5), pady=3)
+        self.search_entry.bind('<Return>', lambda event: self.start_search())
+
+        self.search_button = tk.Button(
+            self.menu_bar, text="搜索", command=self.start_search, padx=10
+        )
+        self.search_button.pack(side='left', padx=(0, 4), pady=2)
+
+        self.stop_search_button = tk.Button(
+            self.menu_bar,
+            text="停止搜索",
+            command=self.stop_search,
+            state=tk.DISABLED,
+            padx=10
+        )
+        self.stop_search_button.pack(side='left', padx=(0, 6), pady=2)
+
+        tk.Checkbutton(
+            self.menu_bar,
+            text="搜索子文件夹",
+            variable=self.search_subfolders,
+            relief=tk.FLAT
+        ).pack(side='left', padx=(0, 6))
         
         # 更新收藏夹菜单
         self.update_favorites_menu()
+
+    def get_current_search_directory(self):
+        """返回当前打开的文件夹，文件节点按其所在文件夹处理。"""
+        if self.current_directory and os.path.isdir(self.current_directory):
+            return os.path.abspath(self.current_directory)
+
+        selected = self.tree.selection()
+        if selected:
+            values = self.tree.item(selected[0]).get('values', ())
+            if values:
+                selected_path = os.path.abspath(values[0])
+                if os.path.isdir(selected_path):
+                    return selected_path
+                if os.path.isfile(selected_path):
+                    return os.path.dirname(selected_path)
+
+        if hasattr(self, 'current_file_path') and os.path.isfile(self.current_file_path):
+            return os.path.dirname(os.path.abspath(self.current_file_path))
+
+        if self.last_visited_directory and os.path.isdir(self.last_visited_directory):
+            return os.path.abspath(self.last_visited_directory)
+
+        return None
+
+    def start_search(self):
+        """从当前文件夹开始异步搜索图片文件。"""
+        root_directory = self.get_current_search_directory()
+        if not root_directory:
+            messagebox.showwarning("无法搜索", "请先在目录树中打开一个文件夹。")
+            return
+
+        # 终止仍在收尾的旧搜索，并使旧轮询回调失效。
+        self.search_stop_event.set()
+        if self.search_poll_job is not None:
+            try:
+                self.root.after_cancel(self.search_poll_job)
+            except tk.TclError:
+                pass
+            self.search_poll_job = None
+
+        self.search_generation += 1
+        generation = self.search_generation
+        self.search_stop_event = threading.Event()
+        self.search_result_queue = queue.Queue()
+        self.search_result_count = 0
+        self.search_result_paths = []
+
+        query_text = self.search_query.get().strip()
+        include_subfolders = self.search_subfolders.get()
+        self.show_search_results_window(root_directory, query_text)
+        self.search_status.set("正在搜索……已找到 0 个文件")
+        self.search_button.configure(state=tk.DISABLED)
+        self.stop_search_button.configure(state=tk.NORMAL)
+
+        self.search_thread = threading.Thread(
+            target=self.search_files_worker,
+            args=(
+                root_directory,
+                query_text.casefold(),
+                include_subfolders,
+                self.search_stop_event,
+                self.search_result_queue
+            ),
+            daemon=True
+        )
+        self.search_thread.start()
+        self.poll_search_results(generation, self.search_result_queue)
+
+    def search_files_worker(self, root_directory, query, include_subfolders,
+                            stop_event, result_queue):
+        """后台扫描文件；所有 Tk 界面更新均交回主线程。"""
+        result_count = 0
+        error_count = 0
+
+        def add_result(file_path):
+            nonlocal result_count
+            file_path = os.path.abspath(file_path)
+            relative_path = os.path.relpath(file_path, root_directory)
+            if query and query not in relative_path.casefold():
+                return
+            # 当前文件夹内只显示文件名；子文件夹内显示以当前文件夹为根的相对路径。
+            if os.path.dirname(relative_path) in ('', '.'):
+                display_path = os.path.basename(relative_path)
+            else:
+                display_path = relative_path
+            result_queue.put(('result', display_path, file_path))
+            result_count += 1
+
+        def record_walk_error(error):
+            nonlocal error_count
+            error_count += 1
+
+        try:
+            if include_subfolders:
+                for folder, subfolders, filenames in os.walk(
+                        root_directory, topdown=True, onerror=record_walk_error,
+                        followlinks=False):
+                    if stop_event.is_set():
+                        subfolders[:] = []
+                        break
+
+                    for filename in filenames:
+                        if stop_event.is_set():
+                            break
+                        if filename.lower().endswith(self.IMAGE_EXTENSIONS):
+                            add_result(os.path.join(folder, filename))
+            else:
+                try:
+                    with os.scandir(root_directory) as entries:
+                        for entry in entries:
+                            if stop_event.is_set():
+                                break
+                            try:
+                                if (entry.is_file() and
+                                        entry.name.lower().endswith(self.IMAGE_EXTENSIONS)):
+                                    add_result(entry.path)
+                            except (OSError, PermissionError):
+                                error_count += 1
+                except (OSError, PermissionError):
+                    error_count += 1
+        except Exception:
+            # 单个不可访问路径不应让整个程序退出，完成信息会提示跳过数量。
+            error_count += 1
+        finally:
+            result_queue.put(
+                ('done', result_count, stop_event.is_set(), error_count)
+            )
+
+    def get_saved_search_window_size(self):
+        """读取并校验搜索结果窗口上次保存的宽高。"""
+        default_width = 950
+        default_height = 520
+        try:
+            config = self.load_config()
+            saved_size = config.get(
+                self.CONFIG_KEYS['SEARCH_RESULTS_SIZE'],
+                f"{default_width}x{default_height}"
+            )
+            width_text, height_text = saved_size.lower().split('x', 1)
+            width = int(width_text)
+            height = int(height_text)
+
+            # 避免损坏的配置或显示器变化导致窗口不可用。
+            width = max(600, min(width, self.root.winfo_screenwidth()))
+            height = max(300, min(height, self.root.winfo_screenheight()))
+            return width, height
+        except (ValueError, TypeError):
+            return default_width, default_height
+
+    def get_desktop_bounds(self):
+        """返回当前虚拟桌面的左上角坐标及总宽高。"""
+        if os.name == 'nt':
+            try:
+                # Windows 虚拟桌面包含所有当前启用的显示器，也支持负坐标副屏。
+                user32 = ctypes.windll.user32
+                left = user32.GetSystemMetrics(76)    # SM_XVIRTUALSCREEN
+                top = user32.GetSystemMetrics(77)     # SM_YVIRTUALSCREEN
+                width = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+                height = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+                if width > 0 and height > 0:
+                    return left, top, width, height
+            except (AttributeError, OSError):
+                pass
+
+        return (0, 0, self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight())
+
+    def get_default_search_window_position(self, width, height):
+        """默认在当前主屏幕中央显示搜索结果窗口。"""
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        return x, y
+
+    def get_saved_search_window_position(self, width, height):
+        """读取保存位置；若窗口会超出当前桌面，则返回默认位置。"""
+        default_position = self.get_default_search_window_position(width, height)
+        try:
+            config = self.load_config()
+            saved_position = config.get(
+                self.CONFIG_KEYS['SEARCH_RESULTS_POSITION'], ''
+            )
+            x_text, y_text = saved_position.split(',', 1)
+            x = int(x_text)
+            y = int(y_text)
+
+            desktop_x, desktop_y, desktop_width, desktop_height = (
+                self.get_desktop_bounds()
+            )
+            desktop_right = desktop_x + desktop_width
+            desktop_bottom = desktop_y + desktop_height
+
+            # 必须保证整个窗口都位于当前虚拟桌面内。
+            if (x < desktop_x or y < desktop_y or
+                    x + width > desktop_right or
+                    y + height > desktop_bottom):
+                return default_position
+            return x, y
+        except (ValueError, TypeError):
+            return default_position
+
+    def schedule_search_window_geometry_save(self, event=None):
+        """移动或缩放窗口时延迟保存，避免操作过程中频繁写入配置文件。"""
+        if (event is not None and
+                event.widget is not self.search_results_window):
+            return
+
+        if self.search_size_save_job is not None:
+            try:
+                self.root.after_cancel(self.search_size_save_job)
+            except tk.TclError:
+                pass
+
+        self.search_size_save_job = self.root.after(
+            500, self.save_search_window_geometry
+        )
+
+    def save_search_window_geometry(self):
+        """把搜索结果窗口当前大小和位置保存到 setup.ini。"""
+        self.search_size_save_job = None
+        if (self.search_results_window is None or
+                not self.search_results_window.winfo_exists()):
+            return
+
+        # 最小化或最大化时的坐标不是用户可复用的普通窗口位置。
+        if self.search_results_window.state() != 'normal':
+            return
+
+        width = self.search_results_window.winfo_width()
+        height = self.search_results_window.winfo_height()
+        x = self.search_results_window.winfo_x()
+        y = self.search_results_window.winfo_y()
+        if width >= 600 and height >= 300:
+            self.save_config(
+                self.CONFIG_KEYS['SEARCH_RESULTS_SIZE'],
+                f"{width}x{height}"
+            )
+            self.save_config(
+                self.CONFIG_KEYS['SEARCH_RESULTS_POSITION'],
+                f"{x},{y}"
+            )
+
+    def show_search_results_window(self, root_directory, query_text):
+        """创建或重用可移动、可关闭且非置顶的搜索结果窗口。"""
+        window_exists = (
+            self.search_results_window is not None and
+            self.search_results_window.winfo_exists()
+        )
+
+        if not window_exists:
+            self.search_results_window = tk.Toplevel(self.root)
+            self.search_results_window.title("搜索结果")
+            saved_width, saved_height = self.get_saved_search_window_size()
+            saved_x, saved_y = self.get_saved_search_window_position(
+                saved_width, saved_height
+            )
+            self.search_results_window.geometry(
+                f"{saved_width}x{saved_height}{saved_x:+d}{saved_y:+d}"
+            )
+            self.search_results_window.minsize(600, 300)
+            self.search_results_window.protocol(
+                "WM_DELETE_WINDOW", self.close_search_results_window
+            )
+            self.search_results_window.bind(
+                '<Configure>', self.schedule_search_window_geometry_save
+            )
+
+            self.search_root_label = tk.Label(
+                self.search_results_window,
+                anchor='w',
+                justify='left',
+                padx=8,
+                pady=7
+            )
+            self.search_root_label.pack(fill='x')
+
+            result_frame = tk.Frame(self.search_results_window)
+            result_frame.pack(fill='both', expand=True, padx=8)
+
+            vertical_scrollbar = tk.Scrollbar(result_frame, orient='vertical')
+            vertical_scrollbar.pack(side='right', fill='y')
+            horizontal_scrollbar = tk.Scrollbar(result_frame, orient='horizontal')
+            horizontal_scrollbar.pack(side='bottom', fill='x')
+
+            self.search_results_listbox = tk.Listbox(
+                result_frame,
+                selectmode=tk.SINGLE,
+                yscrollcommand=vertical_scrollbar.set,
+                xscrollcommand=horizontal_scrollbar.set
+            )
+            self.search_results_listbox.pack(fill='both', expand=True)
+            vertical_scrollbar.configure(command=self.search_results_listbox.yview)
+            horizontal_scrollbar.configure(command=self.search_results_listbox.xview)
+            self.search_results_listbox.bind(
+                '<<ListboxSelect>>', self.open_selected_search_result
+            )
+
+            tk.Label(
+                self.search_results_window,
+                textvariable=self.search_status,
+                anchor='w',
+                padx=8,
+                pady=7
+            ).pack(fill='x')
+        else:
+            self.search_results_window.deiconify()
+            self.search_results_window.lift()
+
+        keyword_display = query_text if query_text else "（空，列出全部图片）"
+        root_name = os.path.basename(os.path.normpath(root_directory))
+        root_display = root_name if root_name else "当前打开文件夹"
+        self.search_root_label.configure(
+            text=(f"根目录：{root_display}（以下路径均相对此文件夹）\n"
+                  f"关键词：{keyword_display}")
+        )
+        self.search_results_listbox.delete(0, tk.END)
+        self.search_result_paths = []
+
+    def poll_search_results(self, generation, result_queue):
+        """分批把后台搜索结果加入列表，保持界面响应。"""
+        if generation != self.search_generation:
+            return
+
+        if (self.search_results_window is None or
+                not self.search_results_window.winfo_exists()):
+            self.search_stop_event.set()
+            return
+
+        done_info = None
+        processed = 0
+        while processed < 300:
+            try:
+                item = result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            processed += 1
+            if item[0] == 'result':
+                # 界面显示相对路径，真实绝对路径只保存在内部列表中用于加载图片。
+                self.search_results_listbox.insert(tk.END, item[1])
+                self.search_result_paths.append(item[2])
+                self.search_result_count += 1
+            elif item[0] == 'done':
+                done_info = item
+                break
+
+        if done_info is not None:
+            _, result_count, was_stopped, error_count = done_info
+            if was_stopped:
+                status_text = f"搜索已停止，共找到 {result_count} 个文件"
+            else:
+                status_text = f"搜索完成，共找到 {result_count} 个文件"
+            if error_count:
+                status_text += f"；跳过 {error_count} 个无法访问的项目"
+            self.search_status.set(status_text)
+            self.search_button.configure(state=tk.NORMAL)
+            self.stop_search_button.configure(state=tk.DISABLED)
+            self.search_thread = None
+            self.search_poll_job = None
+            return
+
+        self.search_status.set(
+            f"正在搜索……已找到 {self.search_result_count} 个文件"
+        )
+        self.search_poll_job = self.root.after(
+            50, lambda: self.poll_search_results(generation, result_queue)
+        )
+
+    def stop_search(self):
+        """请求后台线程停止当前搜索。"""
+        if self.search_thread is not None and self.search_thread.is_alive():
+            self.search_stop_event.set()
+            self.search_status.set("正在停止搜索……")
+            self.stop_search_button.configure(state=tk.DISABLED)
+
+    def close_search_results_window(self):
+        """关闭结果窗口，同时终止与该窗口对应的搜索。"""
+        self.search_stop_event.set()
+        self.search_generation += 1
+        if self.search_poll_job is not None:
+            try:
+                self.root.after_cancel(self.search_poll_job)
+            except tk.TclError:
+                pass
+            self.search_poll_job = None
+
+        if self.search_size_save_job is not None:
+            try:
+                self.root.after_cancel(self.search_size_save_job)
+            except tk.TclError:
+                pass
+            self.search_size_save_job = None
+
+        # 销毁窗口前立即保存，确保下次打开时恢复最后的大小和位置。
+        self.save_search_window_geometry()
+
+        if (self.search_results_window is not None and
+                self.search_results_window.winfo_exists()):
+            self.search_results_window.destroy()
+        self.search_results_window = None
+        self.search_results_listbox = None
+        self.search_result_paths = []
+        self.search_button.configure(state=tk.NORMAL)
+        self.stop_search_button.configure(state=tk.DISABLED)
+
+    def open_selected_search_result(self, event=None):
+        """单击搜索结果后，在主窗口中显示图片并保持结果窗口在前。"""
+        if self.search_results_listbox is None:
+            return
+        selection = self.search_results_listbox.curselection()
+        if not selection:
+            return
+
+        selected_index = selection[0]
+        if selected_index >= len(self.search_result_paths):
+            return
+        file_path = self.search_result_paths[selected_index]
+        if not os.path.isfile(file_path):
+            messagebox.showwarning(
+                "文件不存在", f"该文件可能已被移动或删除：\n{file_path}",
+                parent=self.search_results_window
+            )
+            return
+
+        try:
+            self.display_image(file_path)
+            self.current_directory = os.path.dirname(file_path)
+            self.last_visited_directory = self.current_directory
+        except Exception as error:
+            messagebox.showerror(
+                "无法打开图片", f"无法加载图片：\n{file_path}\n\n{error}",
+                parent=self.search_results_window
+            )
     
     def show_timed_message(self, message, seconds=3):
         """显示定时消息对话框"""
@@ -454,9 +990,11 @@ class ImageViewer:
         if os.path.isfile(file_path):
             self.display_image(file_path)
             self.last_visited_directory = os.path.dirname(file_path)
+            self.current_directory = self.last_visited_directory
         else:
             # 如果是目录，切换展开/收拢状态
             self.last_visited_directory = file_path
+            self.current_directory = file_path
             is_open = self.tree.item(selected_item, 'open')
             self.tree.item(selected_item, open=not is_open)
             
@@ -466,187 +1004,510 @@ class ImageViewer:
                     self.tree.delete(children[0])
                     self.populate_node(selected_item)
     
-    def display_image(self, file_path):
-        self.current_image = Image.open(file_path)
-        self.current_file_path = file_path  # 存当前文件路径
-        self.load_image_config(file_path)  # 加载置
-        self.show_image()
-    
-    def show_image(self):
-        if self.current_image:
-            width, height = self.current_image.size
-            scaled_width = int(width * self.scale)
-            scaled_height = int(height * self.scale)
-            
-            # 缩放图片
-            image = self.current_image.resize(
-                (scaled_width, scaled_height), 
+    def start_lazy_render_worker(self):
+        """启动唯一的后台 Pillow 渲染线程。"""
+        if self.lazy_render_thread is not None and self.lazy_render_thread.is_alive():
+            return
+        self.lazy_render_stop_event.clear()
+        self.lazy_render_thread = threading.Thread(
+            target=self.lazy_render_worker,
+            daemon=True
+        )
+        self.lazy_render_thread.start()
+
+    def lazy_render_worker(self):
+        """后台逐页缩放；不能在此线程中创建任何 Tk 对象。"""
+        while not self.lazy_render_stop_event.is_set():
+            try:
+                task = self.lazy_render_task_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            (_, _, _, _, generation, page_index,
+             request_id, context) = task
+            if generation != self.render_generation:
+                continue
+
+            page_image = None
+            error = None
+            try:
+                page_image = self.render_lazy_page(context, page_index)
+            except Exception as exc:
+                error = str(exc)
+
+            if generation == self.render_generation:
+                self.lazy_render_result_queue.put(
+                    (generation, page_index, request_id, page_image, error)
+                )
+
+    def render_lazy_page(self, context, page_index):
+        """从原图对应区域直接生成一页，避免创建整张放大后的长图。"""
+        source_image = context['source_image']
+        scaled_width = context['scaled_width']
+
+        if not context['split']:
+            return source_image.resize(
+                (scaled_width, context['scaled_height']),
                 Image.Resampling.LANCZOS
             )
-            
-            # 清空画布
-            self.canvas.delete("all")
-            
-            # 如果片高度超过画布高度，进行拆分显示
-            canvas_height = self.canvas.winfo_height()
-            if scaled_height > canvas_height:
-                self.split_image(image, scaled_width, scaled_height, canvas_height)
-            else:
-                # 显示单个图片
-                photo = ImageTk.PhotoImage(image)
-                self.canvas.create_image(0, 0, anchor='nw', image=photo)
-                self.canvas.image = photo  # 保持引用
-    
-    def split_image(self, image, width, height, canvas_height):
-        # 计算需要的页面数
-        overlap = int(canvas_height * self.overlap_ratio)  # 使用动态重叠比例
-        effective_height = canvas_height - overlap
+
+        start_y = page_index * context['effective_height']
+        page_height = min(
+            context['canvas_height'],
+            context['scaled_height'] - start_y
+        )
+
+        # Pillow 的 box 参数可直接按整图坐标采样该页，效果与整图缩放后裁切一致。
+        source_top = (
+            start_y * source_image.height / context['scaled_height']
+        )
+        source_bottom = (
+            (start_y + page_height) * source_image.height /
+            context['scaled_height']
+        )
+        return source_image.resize(
+            (scaled_width, page_height),
+            Image.Resampling.LANCZOS,
+            box=(0, source_top, source_image.width, source_bottom)
+        )
+
+    def begin_image_render(self):
+        """使旧渲染任务失效并释放旧页面缓存。"""
+        self.render_generation += 1
+        generation = self.render_generation
+        self.lazy_render_context = None
+
+        for job_name in ('lazy_render_poll_job', 'lazy_view_request_job'):
+            job = getattr(self, job_name)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, job_name, None)
+
+        # 移除尚未开始的旧任务；正在处理的单页会在完成后因代次不符而被丢弃。
+        for task_queue in (self.lazy_render_task_queue,
+                           self.lazy_render_result_queue):
+            while True:
+                try:
+                    task_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        self.lazy_page_items = {}
+        self.lazy_page_placeholders = {}
+        self.lazy_page_images = {}
+        self.lazy_page_request_ids = {}
+        self.lazy_page_request_priorities = {}
+        self.lazy_needed_pages = set()
+        self.lazy_failed_pages = set()
+        self.photo_images = []
+        self.canvas.image = None
+        return generation
+
+    def cancel_pending_zoom_render(self):
+        if self.zoom_render_job is not None:
+            try:
+                self.root.after_cancel(self.zoom_render_job)
+            except tk.TclError:
+                pass
+            self.zoom_render_job = None
+
+    def display_image(self, file_path):
+        self.cancel_pending_zoom_render()
+        self.current_image = Image.open(file_path)
+        self.current_file_path = file_path  # 存当前文件路径
+        self.current_directory = os.path.dirname(os.path.abspath(file_path))
+        self.load_image_config(file_path)  # 加载设置
+        self.reset_view_on_next_render = True
+        self.show_image()
+
+    def run_deferred_image_render(self):
+        self.deferred_render_job = None
+        self.show_image()
+
+    def show_image(self):
+        if not self.current_image:
+            return
+
+        canvas_height = self.canvas.winfo_height()
+        if canvas_height < 20:
+            # 程序刚启动时画布可能暂时只有 1 像素，等布局完成后再分页。
+            if self.deferred_render_job is None:
+                self.deferred_render_job = self.root.after(
+                    100, self.run_deferred_image_render
+                )
+            return
+
+        if self.deferred_render_job is not None:
+            try:
+                self.root.after_cancel(self.deferred_render_job)
+            except tk.TclError:
+                pass
+            self.deferred_render_job = None
+
+        old_xview = self.canvas.xview()[0]
+        if getattr(self, 'reset_view_on_next_render', False):
+            old_xview = 0.0
+            self.reset_view_on_next_render = False
+
+        source_width, source_height = self.current_image.size
+        scaled_width = max(1, int(source_width * self.scale))
+        scaled_height = max(1, int(source_height * self.scale))
+        generation = self.begin_image_render()
+        self.canvas.delete("all")
+
+        if scaled_height > canvas_height:
+            self.split_image(
+                self.current_image,
+                scaled_width,
+                scaled_height,
+                canvas_height,
+                generation
+            )
+        else:
+            self.setup_lazy_single_image(
+                self.current_image,
+                scaled_width,
+                scaled_height,
+                canvas_height,
+                generation
+            )
+
+        self.canvas.xview_moveto(old_xview)
+        self.schedule_visible_page_request(0)
+
+    def setup_lazy_single_image(self, source_image, width, height,
+                                canvas_height, generation):
+        """单页图片也交给后台缩放，避免大宽图阻塞主线程。"""
+        total_width = max(width, 1)
+        self.canvas.config(
+            scrollregion=(0, 0, total_width, max(canvas_height, height))
+        )
+        self.lazy_render_context = {
+            'generation': generation,
+            'source_image': source_image,
+            'scale': self.scale,
+            'scaled_width': width,
+            'scaled_height': height,
+            'canvas_height': canvas_height,
+            'effective_height': height,
+            'num_pages': 1,
+            'page_width': total_width,
+            'total_width': total_width,
+            'split': False
+        }
+        self.lazy_page_items[0] = self.canvas.create_image(
+            0, 0, anchor='nw'
+        )
+        self.lazy_page_placeholders[0] = self.canvas.create_text(
+            min(width, max(100, self.canvas.winfo_width())) / 2,
+            min(height, canvas_height) / 2,
+            text="正在生成图片……",
+            fill='#7f8c8d',
+            font=('Arial', 11)
+        )
+
+    def split_image(self, source_image, width, height,
+                    canvas_height, generation):
+        """建立分页骨架；实际页面由可见范围驱动按需生成。"""
+        overlap = int(canvas_height * self.overlap_ratio)
+        effective_height = max(1, canvas_height - overlap)
         num_pages = (height + effective_height - 1) // effective_height
-        
-        # 计算每个页面的宽度，为原始宽度加上边框空间
-        page_width = width + 20  # 添加边框空间
-        
-        # 调整画布大小以容纳所有页面
+        page_width = width + 20
         total_width = page_width * num_pages
         self.canvas.config(scrollregion=(0, 0, total_width, canvas_height))
-        
-        # 存所有的PhotoImage对象
-        self.photo_images = []
-        
-        # 建遮罩图像（如果需要）
-        if self.show_mask.get():
-            # 创建一个纯半透明遮罩图像
-            mask_color = (144, 238, 144, 25)  # 浅绿色，alpha=25 (90%透明)
-            mask_image = Image.new('RGBA', (width, overlap), mask_color)  # 只创建重叠分高度的遮罩
+
+        self.lazy_render_context = {
+            'generation': generation,
+            'source_image': source_image,
+            'scale': self.scale,
+            'scaled_width': width,
+            'scaled_height': height,
+            'canvas_height': canvas_height,
+            'effective_height': effective_height,
+            'num_pages': num_pages,
+            'page_width': page_width,
+            'total_width': total_width,
+            'split': True
+        }
+
+        mask_photo = None
+        if self.show_mask.get() and overlap > 0:
+            mask_color = (144, 238, 144, 25)
+            mask_image = Image.new('RGBA', (width, overlap), mask_color)
             mask_photo = ImageTk.PhotoImage(mask_image)
-            self.photo_images.append(mask_photo)  # 保持引用
-        
-        # 显示每个页面
+            self.photo_images.append(mask_photo)
+
         for i in range(num_pages):
-            # 计算当前页面的起始位置
-            start_y = i * (canvas_height - overlap)
-            
-            # 创建当前页面的图像
-            page_height = min(canvas_height, height - start_y)
-            page = image.crop((0, start_y, width, start_y + page_height))
-            photo = ImageTk.PhotoImage(page)
-            self.photo_images.append(photo)
-            
-            # 在画布上显示当前页面
             x = i * page_width + 10
-            
-            # 绘制漂亮的边框
             border_x = x - 5
-            
-            # 先画主边框
+
             self.canvas.create_rectangle(
                 border_x, 5,
                 border_x + width + 10, canvas_height - 5,
-                outline='#4a90e2',
-                width=2,
-                dash=None
+                outline='#4a90e2', width=2, dash=None
             )
-            
-            # 添加内阴影效果 - 所有页面都画完整的三边阴影
-            # 边阴影
             self.canvas.create_line(
-                border_x + 1, 6,
-                border_x + width + 9, 6,
-                fill='#2c3e50',
-                width=1
+                border_x + 1, 6, border_x + width + 9, 6,
+                fill='#2c3e50', width=1
             )
-            
-            # 左边阴影
             self.canvas.create_line(
-                border_x + 1, 6,
-                border_x + 1, canvas_height - 6,
-                fill='#2c3e50',
-                width=1
+                border_x + 1, 6, border_x + 1, canvas_height - 6,
+                fill='#2c3e50', width=1
             )
-            
-            # 下边阴影 - 每一页画
             self.canvas.create_line(
                 border_x + 1, canvas_height - 6,
                 border_x + width + 9, canvas_height - 6,
-                fill='#2c3e50',
-                width=1
+                fill='#2c3e50', width=1
             )
-            
-            # 显示图片
-            self.canvas.create_image(x, 10, anchor='nw', image=photo)
-            
-            # 如果启用了遮罩，添加半透明遮罩
-            if self.show_mask.get():
-                if i == 0:  # 第一页
-                    # 在底部添加罩
+
+            self.lazy_page_items[i] = self.canvas.create_image(
+                x, 10, anchor='nw'
+            )
+
+            if mask_photo is not None:
+                if i == 0:
                     self.canvas.create_image(
-                        x, canvas_height - overlap + 10,  # 起点
-                        anchor='nw',
-                        image=mask_photo
+                        x, canvas_height - overlap + 10,
+                        anchor='nw', image=mask_photo
                     )
-                else:  # 其他页
-                    # 在顶部添加遮罩
+                else:
                     self.canvas.create_image(
-                        x, 10,  # 起
-                        anchor='nw',
-                        image=mask_photo
+                        x, 10, anchor='nw', image=mask_photo
                     )
-                    
-                    # 如果不是最后一页，底部也添加遮罩
                     if i < num_pages - 1:
                         self.canvas.create_image(
-                            x, canvas_height - overlap + 10,  # 起点
-                            anchor='nw',
-                            image=mask_photo
+                            x, canvas_height - overlap + 10,
+                            anchor='nw', image=mask_photo
                         )
-            
-            # 添加重叠部分的分隔线
-            if i == 0:  # 第一页
-                # 在底部画红线
+
+            if i == 0:
                 self.canvas.create_line(
-                    x, canvas_height - overlap + 10,  # 起点
-                    x + width, canvas_height - overlap + 10,  # 终点
-                    fill='red',
-                    width=1
+                    x, canvas_height - overlap + 10,
+                    x + width, canvas_height - overlap + 10,
+                    fill='red', width=1
                 )
-            else:  # 其他
-                # 在顶部画红线
+            else:
                 self.canvas.create_line(
-                    x, overlap + 10,  # 起点
-                    x + width, overlap + 10,  # 终点
-                    fill='red',
-                    width=1
+                    x, overlap + 10, x + width, overlap + 10,
+                    fill='red', width=1
                 )
-                
-                # 如果不是最后一页，在底部也画红线
                 if i < num_pages - 1:
                     self.canvas.create_line(
-                        x, canvas_height - overlap + 10,  # 起
-                        x + width, canvas_height - overlap + 10,  # 终点
-                        fill='red',
-                        width=1
+                        x, canvas_height - overlap + 10,
+                        x + width, canvas_height - overlap + 10,
+                        fill='red', width=1
                     )
-            
-            # 添加码和重叠比例信息
+
             self.canvas.create_text(
-                border_x + width/2 + 5,
+                border_x + width / 2 + 5,
                 canvas_height - 20,
-                text=f"第 {i+1}/{num_pages} 页 (重叠: {int(self.overlap_ratio*100)}%)",
+                text=(f"第 {i + 1}/{num_pages} 页 "
+                      f"(重叠: {int(self.overlap_ratio * 100)}%)"),
                 fill='#4a90e2',
                 font=('Arial', 10)
             )
-    
+            self.lazy_page_placeholders[i] = self.canvas.create_text(
+                x + min(width, max(100, self.canvas.winfo_width())) / 2,
+                canvas_height / 2,
+                text=f"正在生成第 {i + 1} 页……",
+                fill='#7f8c8d',
+                font=('Arial', 11)
+            )
+
+    def on_horizontal_scroll(self, *args):
+        self.canvas.xview(*args)
+        self.schedule_visible_page_request()
+
+    def schedule_visible_page_request(self, delay=30):
+        if self.lazy_render_context is None:
+            return
+        if self.lazy_view_request_job is not None:
+            try:
+                self.root.after_cancel(self.lazy_view_request_job)
+            except tk.TclError:
+                pass
+        self.lazy_view_request_job = self.root.after(
+            delay, self.request_visible_pages
+        )
+
+    def request_visible_pages(self):
+        """优先请求当前可见页，并预取前后相邻页面。"""
+        self.lazy_view_request_job = None
+        context = self.lazy_render_context
+        if context is None or context['generation'] != self.render_generation:
+            return
+
+        page_width = max(1, context['page_width'])
+        total_width = max(1, context['total_width'])
+        canvas_width = max(1, self.canvas.winfo_width())
+        view_left = self.canvas.xview()[0] * total_width
+        view_right = min(total_width, view_left + canvas_width)
+        first_visible = max(0, int(view_left // page_width))
+        last_visible = min(
+            context['num_pages'] - 1,
+            int(max(view_left, view_right - 1) // page_width)
+        )
+
+        visible_pages = set(range(first_visible, last_visible + 1))
+        first_needed = max(0, first_visible - self.lazy_prefetch_count)
+        last_needed = min(
+            context['num_pages'] - 1,
+            last_visible + self.lazy_prefetch_count
+        )
+        needed_pages = set(range(first_needed, last_needed + 1))
+        self.lazy_needed_pages = needed_pages
+
+        # 视野已经离开的未完成请求作废；以后滚回时会按新的优先级重新请求。
+        for page_index in list(self.lazy_page_request_ids):
+            if (page_index not in needed_pages and
+                    page_index not in self.lazy_page_images):
+                self.lazy_page_request_ids.pop(page_index, None)
+                self.lazy_page_request_priorities.pop(page_index, None)
+        self.lazy_failed_pages.intersection_update(needed_pages)
+
+        # 只保留可见页和邻页，远处页面释放后可在再次接近时重新生成。
+        for page_index in list(self.lazy_page_images):
+            if page_index not in needed_pages:
+                try:
+                    self.canvas.itemconfigure(
+                        self.lazy_page_items[page_index], image=''
+                    )
+                    self.canvas.itemconfigure(
+                        self.lazy_page_placeholders[page_index],
+                        state='normal', text=f"正在生成第 {page_index + 1} 页……"
+                    )
+                except tk.TclError:
+                    pass
+                self.lazy_page_images.pop(page_index, None)
+                self.lazy_page_request_ids.pop(page_index, None)
+                self.lazy_page_request_priorities.pop(page_index, None)
+                self.lazy_failed_pages.discard(page_index)
+
+        center_page = (first_visible + last_visible) / 2
+        ordered_pages = sorted(
+            needed_pages,
+            key=lambda index: (
+                0 if index in visible_pages else 1,
+                abs(index - center_page)
+            )
+        )
+
+        for page_index in ordered_pages:
+            if (page_index in self.lazy_page_images or
+                    page_index in self.lazy_failed_pages):
+                continue
+            urgency = 0 if page_index in visible_pages else 1
+            old_priority = self.lazy_page_request_priorities.get(page_index)
+            if old_priority is not None and old_priority <= urgency:
+                continue
+
+            self.lazy_task_sequence += 1
+            request_id = self.lazy_task_sequence
+            self.lazy_page_request_ids[page_index] = request_id
+            self.lazy_page_request_priorities[page_index] = urgency
+            try:
+                self.canvas.itemconfigure(
+                    self.lazy_page_placeholders[page_index],
+                    state='normal', text=f"正在生成第 {page_index + 1} 页……"
+                )
+            except tk.TclError:
+                pass
+            self.lazy_render_task_queue.put(
+                (
+                    -self.render_generation,
+                    urgency,
+                    abs(page_index - center_page),
+                    self.lazy_task_sequence,
+                    self.render_generation,
+                    page_index,
+                    request_id,
+                    context
+                )
+            )
+
+        self.ensure_lazy_result_polling()
+
+    def ensure_lazy_result_polling(self):
+        if self.lazy_render_poll_job is None:
+            self.lazy_render_poll_job = self.root.after(
+                15, self.poll_lazy_render_results
+            )
+
+    def poll_lazy_render_results(self):
+        """每次只把一页转换为 Tk 图片，避免集中创建导致界面停顿。"""
+        self.lazy_render_poll_job = None
+        try:
+            result = self.lazy_render_result_queue.get_nowait()
+        except queue.Empty:
+            result = None
+
+        if result is not None:
+            generation, page_index, request_id, page_image, error = result
+            current_request = self.lazy_page_request_ids.get(page_index)
+            result_is_current = (
+                generation == self.render_generation and
+                request_id == current_request and
+                page_index in self.lazy_needed_pages and
+                page_index in self.lazy_page_items
+            )
+
+            if result_is_current:
+                if error is not None or page_image is None:
+                    self.lazy_failed_pages.add(page_index)
+                    self.canvas.itemconfigure(
+                        self.lazy_page_placeholders[page_index],
+                        text="该页生成失败", state='normal'
+                    )
+                else:
+                    try:
+                        photo = ImageTk.PhotoImage(page_image)
+                        self.lazy_page_images[page_index] = photo
+                        self.canvas.itemconfigure(
+                            self.lazy_page_items[page_index], image=photo
+                        )
+                        self.canvas.itemconfigure(
+                            self.lazy_page_placeholders[page_index], state='hidden'
+                        )
+                    except tk.TclError:
+                        self.lazy_failed_pages.add(page_index)
+
+                self.lazy_page_request_ids.pop(page_index, None)
+                self.lazy_page_request_priorities.pop(page_index, None)
+
+        pending_pages = any(
+            page_index in self.lazy_page_request_ids
+            for page_index in self.lazy_needed_pages
+        )
+        if pending_pages:
+            self.lazy_render_poll_job = self.root.after(
+                15, self.poll_lazy_render_results
+            )
+
+    def schedule_zoom_render(self):
+        """合并连续的 +/- 按键，只重绘最后一次缩放比例。"""
+        self.cancel_pending_zoom_render()
+        self.zoom_render_job = self.root.after(80, self.apply_zoom_render)
+
+    def apply_zoom_render(self):
+        self.zoom_render_job = None
+        self.show_image()
+        if hasattr(self, 'current_file_path'):
+            self.save_image_config(self.current_file_path)
+
     def zoom_in(self, event):
+        if not self.current_image:
+            return
         self.scale += 0.1
-        self.show_image()
-        if hasattr(self, 'current_file_path'):
-            self.save_image_config(self.current_file_path)
-    
+        self.schedule_zoom_render()
+
     def zoom_out(self, event):
+        if not self.current_image:
+            return
         self.scale = max(0.1, self.scale - 0.1)
-        self.show_image()
-        if hasattr(self, 'current_file_path'):
-            self.save_image_config(self.current_file_path)
+        self.schedule_zoom_render()
     
     def adjust_overlap(self, event):
         # 根据滚轮方调整重叠比例
@@ -708,6 +1569,29 @@ class ImageViewer:
     
     def on_closing(self):
         """窗口关闭时的处理"""
+        self.search_stop_event.set()
+        zoom_was_pending = self.zoom_render_job is not None
+        self.cancel_pending_zoom_render()
+        self.lazy_render_stop_event.set()
+        self.render_generation += 1
+        for job_name in ('lazy_render_poll_job', 'lazy_view_request_job',
+                         'deferred_render_job', 'resize_timer'):
+            job = getattr(self, job_name, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, job_name, None)
+        if zoom_was_pending and hasattr(self, 'current_file_path'):
+            self.save_image_config(self.current_file_path)
+        if self.search_size_save_job is not None:
+            try:
+                self.root.after_cancel(self.search_size_save_job)
+            except tk.TclError:
+                pass
+            self.search_size_save_job = None
+        self.save_search_window_geometry()
         if self.save_directory_on_close:
             if hasattr(self, 'current_file_path'):
                 # 如果有打开的文件，保存文件路径
@@ -752,6 +1636,7 @@ class ImageViewer:
                 self.canvas.xview_moveto(current[0] - 0.1)  # 向左滚动
             else:
                 self.canvas.xview_moveto(current[0] + 0.1)  # 向右滚动
+            self.schedule_visible_page_request()
     
     def start_resize(self, event):
         """开始调整大小时记初始位置"""
