@@ -1,6 +1,7 @@
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox
+from tkinter import font as tkfont
 from PIL import Image, ImageTk
 import json
 import winreg
@@ -9,10 +10,250 @@ import time
 import queue
 import ctypes
 
+def draw_rounded_rectangle(canvas, x1, y1, x2, y2, radius=12, **kwargs):
+    """在 Canvas 上绘制可缩放的平滑圆角矩形。"""
+    radius = max(1, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1
+    ]
+    return canvas.create_polygon(
+        points, smooth=True, splinesteps=32, **kwargs
+    )
+
+
+class RoundedButton(tk.Canvas):
+    """保持 Tk 按钮常用接口的圆角 Canvas 按钮。"""
+
+    def __init__(self, master, text, command, colors, font,
+                 variant='secondary', width=None, state=tk.NORMAL,
+                 padx=12, pady=6):
+        self._text = text
+        self._command = command
+        self._colors = colors
+        self._variant = variant
+        self._state = str(state)
+        self._hovered = False
+        self._pressed = False
+        self._focused = False
+        self._padx = padx
+        self._pady = pady
+        self._char_width = width
+        self._font = tkfont.Font(master=master, font=font)
+
+        parent_bg = colors['surface']
+        try:
+            parent_bg = master.cget('bg')
+        except tk.TclError:
+            pass
+
+        pixel_width, pixel_height = self._measure()
+        super().__init__(
+            master,
+            width=pixel_width,
+            height=pixel_height,
+            bg=parent_bg,
+            highlightthickness=0,
+            borderwidth=0,
+            relief=tk.FLAT,
+            cursor='hand2',
+            takefocus=1
+        )
+
+        self.bind('<Enter>', self._on_enter)
+        self.bind('<Leave>', self._on_leave)
+        self.bind('<ButtonPress-1>', self._on_press)
+        self.bind('<ButtonRelease-1>', self._on_release)
+        self.bind('<FocusIn>', self._on_focus_in)
+        self.bind('<FocusOut>', self._on_focus_out)
+        self.bind('<Return>', self._on_keyboard_activate)
+        self.bind('<space>', self._on_keyboard_activate)
+        self._draw()
+
+    def _measure(self):
+        text_width = self._font.measure(self._text)
+        if self._char_width is not None:
+            text_width = max(
+                text_width,
+                self._font.measure('0') * int(self._char_width)
+            )
+        width = text_width + self._padx * 2
+        height = self._font.metrics('linespace') + self._pady * 2
+        return max(42, width), max(30, height)
+
+    def _variant_colors(self):
+        variants = {
+            'primary': {
+                'normal': self._colors['primary'],
+                'hover': self._colors['primary_dark'],
+                'pressed': self._colors['primary_dark'],
+                'foreground': '#FFFFFF'
+            },
+            'danger': {
+                'normal': self._colors['danger_soft'],
+                'hover': self._colors['danger'],
+                'pressed': self._colors['danger_dark'],
+                'foreground': self._colors['danger'],
+                'active_foreground': '#FFFFFF'
+            },
+            'ghost': {
+                'normal': self._colors['surface'],
+                'hover': self._colors['primary_soft'],
+                'pressed': self._colors['selection'],
+                'foreground': self._colors['text']
+            },
+            'secondary': {
+                'normal': self._colors['surface_alt'],
+                'hover': self._colors['primary_soft'],
+                'pressed': self._colors['selection'],
+                'foreground': self._colors['text']
+            }
+        }
+        return variants[self._variant]
+
+    def _draw(self):
+        self.delete('all')
+        width = max(2, int(self.cget('width')))
+        height = max(2, int(self.cget('height')))
+        palette = self._variant_colors()
+
+        if self._state == str(tk.DISABLED):
+            fill = self._colors['surface_alt']
+            foreground = self._colors['text_muted']
+        elif self._pressed:
+            fill = palette['pressed']
+            foreground = palette.get(
+                'active_foreground', palette['foreground']
+            )
+        elif self._hovered:
+            fill = palette['hover']
+            foreground = palette.get(
+                'active_foreground', palette['foreground']
+            )
+        else:
+            fill = palette['normal']
+            foreground = palette['foreground']
+
+        outline = (
+            self._colors['primary'] if self._focused
+            else self._colors['border']
+        )
+        draw_rounded_rectangle(
+            self, 1, 1, width - 1, height - 1,
+            radius=min(12, height / 2),
+            fill=fill,
+            outline=outline,
+            width=1
+        )
+        self.create_text(
+            width / 2,
+            height / 2,
+            text=self._text,
+            fill=foreground,
+            font=self._font
+        )
+
+    def _on_enter(self, event):
+        if self._state != str(tk.DISABLED):
+            self._hovered = True
+            self._draw()
+
+    def _on_leave(self, event):
+        self._hovered = False
+        self._pressed = False
+        self._draw()
+
+    def _on_press(self, event):
+        if self._state == str(tk.DISABLED):
+            return 'break'
+        self.focus_set()
+        self._pressed = True
+        self._draw()
+        return 'break'
+
+    def _on_release(self, event):
+        if self._state == str(tk.DISABLED):
+            return 'break'
+        inside = (
+            0 <= event.x <= self.winfo_width()
+            and 0 <= event.y <= self.winfo_height()
+        )
+        was_pressed = self._pressed
+        self._pressed = False
+        self._draw()
+        if inside and was_pressed and self._command is not None:
+            self._command()
+        return 'break'
+
+    def _on_keyboard_activate(self, event):
+        if self._state != str(tk.DISABLED) and self._command is not None:
+            self._command()
+        return 'break'
+
+    def _on_focus_in(self, event):
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, event):
+        self._focused = False
+        self._pressed = False
+        self._draw()
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            if isinstance(cnf, dict):
+                kwargs.update(cnf)
+            else:
+                return super().configure(cnf, **kwargs)
+        if not hasattr(self, '_state'):
+            return super().configure(**kwargs)
+
+        redraw = False
+        resize = False
+        if 'state' in kwargs:
+            self._state = str(kwargs.pop('state'))
+            redraw = True
+        if 'text' in kwargs:
+            self._text = str(kwargs.pop('text'))
+            redraw = True
+            resize = True
+        if 'command' in kwargs:
+            self._command = kwargs.pop('command')
+        if kwargs:
+            super().configure(**kwargs)
+        if resize:
+            width, height = self._measure()
+            super().configure(width=width, height=height)
+        if redraw or resize:
+            self._draw()
+        return None
+
+    config = configure
+
+    def cget(self, key):
+        if key == 'state':
+            return self._state
+        if key == 'text':
+            return self._text
+        if key in ('bg', 'background'):
+            return self._variant_colors()['normal']
+        return super().cget(key)
+
 class ImageViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("乐谱/长图浏览器")
+        self.root.title("乐谱 / 长图浏览器")
+        self.setup_ui_theme()
         
         # 设置全屏
         self.root.state('zoomed')
@@ -61,16 +302,23 @@ class ImageViewer:
         self.config_filename = "image_config.json"
         
         # 创建主框架
-        self.main_frame = tk.Frame(root, bg='white')
+        self.main_frame = tk.Frame(root, bg=self.COLORS['background'])
         self.main_frame.pack(fill='both', expand=True)
         
         # 左侧目录树框架
-        self.tree_frame = tk.Frame(self.main_frame, bg='white')
+        self.tree_frame = tk.Frame(
+            self.main_frame,
+            bg=self.COLORS['surface'],
+            highlightthickness=1,
+            highlightbackground=self.COLORS['border']
+        )
         self.tree_frame.pack(side='left', fill='y')
         
         # 创建一个内部框架来包含目树
-        self.inner_tree_frame = tk.Frame(self.tree_frame, bg='white')
-        self.inner_tree_frame.pack(fill='both', expand=True)
+        self.inner_tree_frame = tk.Frame(
+            self.tree_frame, bg=self.COLORS['surface']
+        )
+        self.inner_tree_frame.pack(fill='both', expand=True, padx=1, pady=1)
         
         # 左侧目录树
         self.tree = ttk.Treeview(self.inner_tree_frame, style='Custom.Treeview')
@@ -79,24 +327,34 @@ class ImageViewer:
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
         self.tree.bind("<Button-3>", self.on_right_click)  # 绑定右键点击事件
         
-        # 创建自定义式
-        style = ttk.Style()
-        style.configure('Custom.Treeview', 
-                       background='white',
-                       fieldbackground='white',
-                       borderwidth=0)  # 移除边框
+        # 创建自定义样式
+        self.ui_style.configure(
+            'Custom.Treeview',
+            background=self.COLORS['surface'],
+            fieldbackground=self.COLORS['surface'],
+            foreground=self.COLORS['text'],
+            borderwidth=0,
+            relief='flat',
+            rowheight=30,
+            font=self.FONTS['normal']
+        )
+        self.ui_style.map(
+            'Custom.Treeview',
+            background=[('selected', self.COLORS['selection'])],
+            foreground=[('selected', self.COLORS['primary_dark'])]
+        )
         
         # 移除选中项的虚线框
-        style.layout('Custom.Treeview', [
+        self.ui_style.layout('Custom.Treeview', [
             ('Custom.Treeview.treearea', {'sticky': 'nswe'})
         ])
         
         #  - 使用简单的Frame
         self.sash = tk.Frame(
             self.main_frame,
-            width=4,
+            width=5,
             cursor='sb_h_double_arrow',
-            bg='#4a90e2',  # 使用蓝色
+            bg=self.COLORS['border'],
             highlightthickness=0
         )
         self.sash.pack(side='left', fill='y', anchor='w')
@@ -104,6 +362,14 @@ class ImageViewer:
         # 绑定事件
         self.sash.bind('<B1-Motion>', self.adjust_tree_width)
         self.sash.bind('<Button-1>', self.start_resize)
+        self.sash.bind(
+            '<Enter>',
+            lambda event: self.sash.configure(bg=self.COLORS['primary'])
+        )
+        self.sash.bind(
+            '<Leave>',
+            lambda event: self.sash.configure(bg=self.COLORS['border'])
+        )
         
         # 加载保存的树宽度
         try:
@@ -116,18 +382,30 @@ class ImageViewer:
         self.tree_frame.pack_propagate(False)  # 防止frame自动调整大小
         
         # 右侧框架（包含画布和滚动条）
-        self.right_frame = tk.Frame(self.main_frame)
+        self.right_frame = tk.Frame(
+            self.main_frame, bg=self.COLORS['canvas_background']
+        )
         self.right_frame.pack(side='left', fill='both', expand=True)
         
         # 右侧图片显示区域
-        self.canvas = tk.Canvas(self.right_frame, bg='white')
+        self.canvas = tk.Canvas(
+            self.right_frame,
+            bg=self.COLORS['canvas_background'],
+            highlightthickness=0,
+            borderwidth=0
+        )
         self.canvas.pack(side='top', fill='both', expand=True)
         
         # 水平滚动条
         self.scrollbar = tk.Scrollbar(
             self.right_frame,
             orient='horizontal',
-            command=self.on_horizontal_scroll
+            command=self.on_horizontal_scroll,
+            bg=self.COLORS['surface_alt'],
+            activebackground=self.COLORS['primary_soft'],
+            troughcolor=self.COLORS['background'],
+            borderwidth=0,
+            highlightthickness=0
         )
         self.scrollbar.pack(side='bottom', fill='x')
         self.canvas.configure(xscrollcommand=self.scrollbar.set)
@@ -163,9 +441,24 @@ class ImageViewer:
         # 加载上次访问的目录
         self.load_last_directory()
         
-        # 绑定键盘事件
-        self.root.bind('<KeyPress-plus>', self.zoom_in)
-        self.root.bind('<KeyPress-minus>', self.zoom_out)
+        # 全局缩放快捷键。搜索框获得焦点时由隔离标签拦截，
+        # 确保所有键盘输入只交给搜索框本身处理。
+        self.root.bind(
+            '<KeyPress-plus>',
+            lambda event: self.dispatch_global_shortcut(event, self.zoom_in)
+        )
+        self.root.bind(
+            '<KeyPress-minus>',
+            lambda event: self.dispatch_global_shortcut(event, self.zoom_out)
+        )
+        self.root.bind(
+            '<KeyPress-KP_Add>',
+            lambda event: self.dispatch_global_shortcut(event, self.zoom_in)
+        )
+        self.root.bind(
+            '<KeyPress-KP_Subtract>',
+            lambda event: self.dispatch_global_shortcut(event, self.zoom_out)
+        )
         
         # 绑定鼠标中键滚动件
         self.canvas.bind("<Button-2>", self.toggle_mask)  # 中键点击切换遮罩
@@ -184,15 +477,19 @@ class ImageViewer:
         self.save_directory_on_close = True
         
         # 配置加粗标记样式
-        self.tree.tag_configure('favorite', font=('TkDefaultFont', 9, 'bold'))
+        self.tree.tag_configure(
+            'favorite',
+            font=self.FONTS['medium'],
+            foreground=self.COLORS['primary']
+        )
         
         # 支持的图片格式
         self.IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
         
         # 收藏夹管理器尺寸
         self.FAVORITES_DIALOG_SIZE = {
-            'width': 500,
-            'height': 400
+            'width': 640,
+            'height': 440
         }
         
         # 配置参数
@@ -207,88 +504,536 @@ class ImageViewer:
             'overlap_step': 0.05
         }
     
+    def setup_ui_theme(self):
+        """配置统一的亮色专业主题，不改变原有界面结构。"""
+        self.COLORS = {
+            'background': '#F4F7FB',
+            'surface': '#FFFFFF',
+            'surface_alt': '#EEF3F8',
+            'canvas_background': '#F4F0FF',
+            'canvas_gradient_top': '#F4F0FF',
+            'canvas_gradient_middle': '#FFF9F5',
+            'canvas_gradient_bottom': '#FFEBDD',
+            'input_background': '#F8FAFC',
+            'text': '#1E293B',
+            'text_muted': '#64748B',
+            'border': '#D7E0EA',
+            'border_strong': '#AFC0D2',
+            'primary': '#2563EB',
+            'primary_dark': '#1D4ED8',
+            'primary_soft': '#DBEAFE',
+            'selection': '#E6F0FF',
+            'accent': '#0F9F91',
+            'accent_soft': '#DDF7F2',
+            'danger': '#DC4C64',
+            'danger_dark': '#BE354D',
+            'danger_soft': '#FDE8EC',
+            'overlap_line': '#F97316'
+        }
+        self.FONTS = {
+            'normal': ('Microsoft YaHei UI', 10),
+            'medium': ('Microsoft YaHei UI', 10, 'bold'),
+            'small': ('Microsoft YaHei UI', 9),
+            'title': ('Microsoft YaHei UI', 11, 'bold')
+        }
+
+        self.root.configure(bg=self.COLORS['background'])
+        self.root.option_add('*Font', self.FONTS['normal'])
+        self.root.option_add('*Frame.background', self.COLORS['surface'])
+        self.root.option_add('*Label.background', self.COLORS['surface'])
+        self.root.option_add('*Label.foreground', self.COLORS['text'])
+
+        self.root.option_add('*Button.background', self.COLORS['surface_alt'])
+        self.root.option_add('*Button.foreground', self.COLORS['text'])
+        self.root.option_add(
+            '*Button.activeBackground', self.COLORS['primary_soft']
+        )
+        self.root.option_add(
+            '*Button.activeForeground', self.COLORS['primary_dark']
+        )
+        self.root.option_add(
+            '*Button.disabledForeground', self.COLORS['text_muted']
+        )
+        self.root.option_add('*Button.relief', 'flat')
+        self.root.option_add('*Button.borderWidth', 0)
+        self.root.option_add('*Button.highlightThickness', 0)
+        self.root.option_add('*Button.cursor', 'hand2')
+        self.root.option_add('*Button.padX', 10)
+        self.root.option_add('*Button.padY', 5)
+
+        self.root.option_add('*Menubutton.background', self.COLORS['surface'])
+        self.root.option_add('*Menubutton.foreground', self.COLORS['text'])
+        self.root.option_add(
+            '*Menubutton.activeBackground', self.COLORS['primary_soft']
+        )
+        self.root.option_add(
+            '*Menubutton.activeForeground', self.COLORS['primary_dark']
+        )
+        self.root.option_add('*Menubutton.relief', 'flat')
+        self.root.option_add('*Menubutton.borderWidth', 0)
+        self.root.option_add('*Menubutton.cursor', 'hand2')
+
+        self.root.option_add('*Checkbutton.background', self.COLORS['surface'])
+        self.root.option_add('*Checkbutton.foreground', self.COLORS['text'])
+        self.root.option_add(
+            '*Checkbutton.activeBackground', self.COLORS['surface']
+        )
+        self.root.option_add(
+            '*Checkbutton.activeForeground', self.COLORS['primary_dark']
+        )
+        self.root.option_add(
+            '*Checkbutton.selectColor', self.COLORS['primary_soft']
+        )
+        self.root.option_add('*Checkbutton.highlightThickness', 0)
+        self.root.option_add('*Checkbutton.cursor', 'hand2')
+
+        self.root.option_add('*Entry.background', self.COLORS['input_background'])
+        self.root.option_add('*Entry.foreground', self.COLORS['text'])
+        self.root.option_add('*Entry.insertBackground', self.COLORS['primary'])
+        self.root.option_add(
+            '*Entry.highlightBackground', self.COLORS['border']
+        )
+        self.root.option_add('*Entry.highlightColor', self.COLORS['primary'])
+        self.root.option_add('*Entry.highlightThickness', 1)
+        self.root.option_add('*Entry.relief', 'flat')
+        self.root.option_add('*Entry.borderWidth', 0)
+
+        self.root.option_add('*Listbox.background', self.COLORS['surface'])
+        self.root.option_add('*Listbox.foreground', self.COLORS['text'])
+        self.root.option_add(
+            '*Listbox.selectBackground', self.COLORS['selection']
+        )
+        self.root.option_add(
+            '*Listbox.selectForeground', self.COLORS['primary_dark']
+        )
+        self.root.option_add(
+            '*Listbox.highlightBackground', self.COLORS['border']
+        )
+        self.root.option_add('*Listbox.highlightColor', self.COLORS['primary'])
+        self.root.option_add('*Listbox.highlightThickness', 1)
+        self.root.option_add('*Listbox.relief', 'flat')
+        self.root.option_add('*Listbox.borderWidth', 0)
+        self.root.option_add('*Listbox.activestyle', 'none')
+
+        self.root.option_add('*Text.background', self.COLORS['surface'])
+        self.root.option_add('*Text.foreground', self.COLORS['text'])
+        self.root.option_add('*Text.selectBackground', self.COLORS['selection'])
+        self.root.option_add(
+            '*Text.selectForeground', self.COLORS['primary_dark']
+        )
+        self.root.option_add('*Text.highlightBackground', self.COLORS['border'])
+        self.root.option_add('*Text.highlightThickness', 1)
+        self.root.option_add('*Text.relief', 'flat')
+
+        self.root.option_add('*Menu.background', self.COLORS['surface'])
+        self.root.option_add('*Menu.foreground', self.COLORS['text'])
+        self.root.option_add(
+            '*Menu.activeBackground', self.COLORS['primary_soft']
+        )
+        self.root.option_add(
+            '*Menu.activeForeground', self.COLORS['primary_dark']
+        )
+        self.root.option_add('*Menu.borderWidth', 1)
+        self.root.option_add('*Menu.relief', 'flat')
+
+        self.root.option_add('*Scrollbar.background', self.COLORS['surface_alt'])
+        self.root.option_add(
+            '*Scrollbar.activeBackground', self.COLORS['primary_soft']
+        )
+        self.root.option_add(
+            '*Scrollbar.troughColor', self.COLORS['background']
+        )
+        self.root.option_add('*Scrollbar.borderWidth', 0)
+        self.root.option_add('*Scrollbar.highlightThickness', 0)
+
+        self.ui_style = ttk.Style(self.root)
+        try:
+            self.ui_style.theme_use('clam')
+        except tk.TclError:
+            pass
+        self.ui_style.configure(
+            'TSeparator', background=self.COLORS['border']
+        )
+
+    def button_style(self, variant='secondary'):
+        """返回统一的 Tk 按钮样式。"""
+        styles = {
+            'primary': (
+                self.COLORS['primary'], '#FFFFFF',
+                self.COLORS['primary_dark'], '#FFFFFF'
+            ),
+            'danger': (
+                self.COLORS['danger_soft'], self.COLORS['danger'],
+                self.COLORS['danger'], '#FFFFFF'
+            ),
+            'ghost': (
+                self.COLORS['surface'], self.COLORS['text'],
+                self.COLORS['primary_soft'], self.COLORS['primary_dark']
+            ),
+            'secondary': (
+                self.COLORS['surface_alt'], self.COLORS['text'],
+                self.COLORS['primary_soft'], self.COLORS['primary_dark']
+            )
+        }
+        bg, fg, active_bg, active_fg = styles[variant]
+        return {
+            'bg': bg,
+            'fg': fg,
+            'activebackground': active_bg,
+            'activeforeground': active_fg,
+            'disabledforeground': self.COLORS['text_muted'],
+            'relief': tk.FLAT,
+            'borderwidth': 0,
+            'highlightthickness': 0,
+            'cursor': 'hand2',
+            'font': self.FONTS['medium'],
+            'padx': 10,
+            'pady': 5
+        }
+
+    def style_dialog(self, dialog):
+        """为子窗口应用与主窗口一致的背景。"""
+        dialog.configure(bg=self.COLORS['background'])
+
+    @staticmethod
+    def blend_hex_colors(start_color, end_color, ratio):
+        """按指定比例混合两个十六进制颜色。"""
+        ratio = max(0.0, min(1.0, ratio))
+        start = tuple(
+            int(start_color[index:index + 2], 16)
+            for index in (1, 3, 5)
+        )
+        end = tuple(
+            int(end_color[index:index + 2], 16)
+            for index in (1, 3, 5)
+        )
+        channels = tuple(
+            round(first + (second - first) * ratio)
+            for first, second in zip(start, end)
+        )
+        return '#{:02X}{:02X}{:02X}'.format(*channels)
+
+    def draw_canvas_gradient(self, total_width=None, canvas_height=None):
+        """绘制明亮的薰衣草紫到暖桃色三段渐变底色。"""
+        if not hasattr(self, 'canvas') or not self.canvas.winfo_exists():
+            return
+
+        visible_width = max(1, self.canvas.winfo_width())
+        visible_height = max(1, self.canvas.winfo_height())
+        gradient_width = max(visible_width, int(total_width or visible_width))
+        gradient_height = max(
+            visible_height, int(canvas_height or visible_height)
+        )
+        steps = max(48, min(120, gradient_height // 5))
+        middle_stop = 0.52
+
+        self.canvas.delete('canvas_gradient')
+        for step in range(steps):
+            ratio = step / max(1, steps - 1)
+            if ratio <= middle_stop:
+                color = self.blend_hex_colors(
+                    self.COLORS['canvas_gradient_top'],
+                    self.COLORS['canvas_gradient_middle'],
+                    ratio / middle_stop
+                )
+            else:
+                color = self.blend_hex_colors(
+                    self.COLORS['canvas_gradient_middle'],
+                    self.COLORS['canvas_gradient_bottom'],
+                    (ratio - middle_stop) / (1.0 - middle_stop)
+                )
+            y1 = int(gradient_height * step / steps)
+            y2 = int(gradient_height * (step + 1) / steps) + 1
+            self.canvas.create_rectangle(
+                0, y1, gradient_width, y2,
+                fill=color,
+                outline=color,
+                width=0,
+                tags=('canvas_gradient',)
+            )
+
+        self.canvas.tag_lower('canvas_gradient')
+
+    def create_round_button(self, parent, text, command, variant='secondary',
+                            width=None, state=tk.NORMAL):
+        """创建与原按钮接口兼容的圆角按钮。"""
+        return RoundedButton(
+            parent,
+            text=text,
+            command=command,
+            colors=self.COLORS,
+            font=self.FONTS['medium'],
+            variant=variant,
+            width=width,
+            state=state
+        )
+
+    def create_rounded_entry(self, parent, textvariable, width=32):
+        """创建带真实圆角边框的输入框，并返回外壳与 Entry。"""
+        entry_font = tkfont.Font(master=parent, font=self.FONTS['normal'])
+        pixel_width = max(160, entry_font.measure('0') * width + 28)
+        pixel_height = max(34, entry_font.metrics('linespace') + 16)
+        try:
+            parent_bg = parent.cget('bg')
+        except tk.TclError:
+            parent_bg = self.COLORS['surface']
+
+        shell = tk.Canvas(
+            parent,
+            width=pixel_width,
+            height=pixel_height,
+            bg=parent_bg,
+            highlightthickness=0,
+            borderwidth=0,
+            relief=tk.FLAT,
+            cursor='xterm'
+        )
+        outline_item = draw_rounded_rectangle(
+            shell, 1, 1, pixel_width - 1, pixel_height - 1,
+            radius=pixel_height / 2,
+            fill=self.COLORS['input_background'],
+            outline=self.COLORS['border'],
+            width=1
+        )
+        entry = tk.Entry(
+            shell,
+            textvariable=textvariable,
+            bg=self.COLORS['input_background'],
+            fg=self.COLORS['text'],
+            insertbackground=self.COLORS['primary'],
+            selectbackground=self.COLORS['selection'],
+            selectforeground=self.COLORS['primary_dark'],
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            font=self.FONTS['normal']
+        )
+        shell.create_window(
+            14, pixel_height / 2,
+            window=entry,
+            anchor='w',
+            width=pixel_width - 28,
+            height=pixel_height - 10
+        )
+
+        entry.bind(
+            '<FocusIn>',
+            lambda event: shell.itemconfigure(
+                outline_item, outline=self.COLORS['primary'], width=2
+            )
+        )
+        entry.bind(
+            '<FocusOut>',
+            lambda event: shell.itemconfigure(
+                outline_item, outline=self.COLORS['border'], width=1
+            )
+        )
+        shell.bind('<Button-1>', lambda event: entry.focus_set())
+        return shell, entry
+
+    def popup_menu(self, menu, anchor):
+        """在圆角菜单按钮下方弹出原生菜单。"""
+        anchor.update_idletasks()
+        try:
+            menu.tk_popup(
+                anchor.winfo_rootx(),
+                anchor.winfo_rooty() + anchor.winfo_height() + 2
+            )
+        finally:
+            menu.grab_release()
+
+    def isolate_search_keyboard_input(self, entry):
+        """让搜索框先执行文本编辑，再阻断所有窗口级键盘绑定。"""
+        guard_tag = f'SearchInputGuard{id(entry)}'
+        entry.bind_class(guard_tag, '<KeyPress>', lambda event: 'break')
+        entry.bind_class(guard_tag, '<KeyRelease>', lambda event: 'break')
+
+        bindtags = list(entry.bindtags())
+        insert_at = len(bindtags)
+        for index, tag in enumerate(bindtags):
+            if tag in (str(self.root), 'all'):
+                insert_at = index
+                break
+        bindtags.insert(insert_at, guard_tag)
+        entry.bindtags(tuple(bindtags))
+
+    def activate_search_from_entry(self, event=None):
+        """允许搜索框使用主回车键或小键盘回车键开始搜索。"""
+        self.start_search()
+        return 'break'
+
+    def is_text_input_focused(self):
+        """判断当前焦点是否位于可编辑文本控件。"""
+        try:
+            focused = self.root.focus_get()
+        except tk.TclError:
+            return False
+        return isinstance(
+            focused,
+            (tk.Entry, tk.Text, tk.Spinbox, ttk.Entry, ttk.Combobox)
+        )
+
+    def dispatch_global_shortcut(self, event, callback):
+        """仅在焦点不位于文本输入控件时执行全局快捷键。"""
+        if self.is_text_input_focused():
+            return 'break'
+        return callback(event)
+
     def create_menu(self):
-        """创建菜单栏"""
-        # Tk 原生菜单不能直接放置文本框和普通按钮，因此使用顶部自定义菜单栏，
-        # 既保留原有菜单，也让搜索控件真正位于同一栏中。
-        self.menu_bar = tk.Frame(self.root, relief=tk.RAISED, borderwidth=1)
+        """创建菜单栏。"""
+        self.menu_bar = tk.Frame(
+            self.root,
+            bg=self.COLORS['surface'],
+            highlightthickness=1,
+            highlightbackground=self.COLORS['border']
+        )
         self.menu_bar.pack(side='top', fill='x')
-        
-        # 创建收藏夹菜单
-        favorites_button = tk.Menubutton(
-            self.menu_bar, text="收藏夹", relief=tk.FLAT, padx=8, pady=3
+
+        menu_options = {
+            'tearoff': 0,
+            'bg': self.COLORS['surface'],
+            'fg': self.COLORS['text'],
+            'activebackground': self.COLORS['primary_soft'],
+            'activeforeground': self.COLORS['primary_dark'],
+            'selectcolor': self.COLORS['primary'],
+            'relief': tk.FLAT,
+            'borderwidth': 1,
+            'activeborderwidth': 0,
+            'font': self.FONTS['normal']
+        }
+
+        # 收藏夹菜单
+        self.favorites_button = self.create_round_button(
+            self.menu_bar,
+            text="收藏夹  ▾",
+            command=None,
+            variant='ghost'
         )
-        favorites_button.pack(side='left')
-        self.favorites_menu = tk.Menu(favorites_button, tearoff=0)
-        favorites_button.configure(menu=self.favorites_menu)
-        self.favorites_menu.add_command(label="整理收藏夹", command=self.show_favorites_manager)
-        
-        # 创建排序菜单
-        sort_button = tk.Menubutton(
-            self.menu_bar, text="排序", relief=tk.FLAT, padx=8, pady=3
+        self.favorites_button.pack(side='left', padx=(8, 2), pady=6)
+        self.favorites_menu = tk.Menu(self.root, **menu_options)
+        self.favorites_button.configure(
+            command=lambda: self.popup_menu(
+                self.favorites_menu, self.favorites_button
+            )
         )
-        sort_button.pack(side='left')
-        sort_menu = tk.Menu(sort_button, tearoff=0)
-        sort_button.configure(menu=sort_menu)
-        sort_menu.add_command(label="时间倒序", command=lambda: self.sort_files("time_desc"))
-        sort_menu.add_command(label="时间顺序", command=lambda: self.sort_files("time_asc"))
-        sort_menu.add_command(label="名称倒序", command=lambda: self.sort_files("name_desc"))
-        sort_menu.add_command(label="名称顺序", command=lambda: self.sort_files("name_asc"))
-        
-        # 添加遮罩选项
+        self.favorites_menu.add_command(
+            label="整理收藏夹…", command=self.show_favorites_manager
+        )
+
+        # 排序菜单
+        self.sort_button = self.create_round_button(
+            self.menu_bar,
+            text="排序  ▾",
+            command=None,
+            variant='ghost'
+        )
+        self.sort_button.pack(side='left', padx=2, pady=6)
+        self.sort_menu = tk.Menu(self.root, **menu_options)
+        self.sort_button.configure(
+            command=lambda: self.popup_menu(self.sort_menu, self.sort_button)
+        )
+        self.sort_menu.add_command(
+            label="时间倒序", command=lambda: self.sort_files("time_desc")
+        )
+        self.sort_menu.add_command(
+            label="时间顺序", command=lambda: self.sort_files("time_asc")
+        )
+        self.sort_menu.add_separator()
+        self.sort_menu.add_command(
+            label="名称倒序", command=lambda: self.sort_files("name_desc")
+        )
+        self.sort_menu.add_command(
+            label="名称顺序", command=lambda: self.sort_files("name_asc")
+        )
+
+        # 遮罩与帮助
         tk.Checkbutton(
             self.menu_bar,
             text="遮罩",
             variable=self.show_mask,
             command=self.refresh_image,
+            bg=self.COLORS['surface'],
+            fg=self.COLORS['text'],
+            activebackground=self.COLORS['surface'],
+            activeforeground=self.COLORS['primary_dark'],
+            selectcolor=self.COLORS['primary_soft'],
             relief=tk.FLAT,
-            padx=8
-        ).pack(side='left')
-        
-        # 添加帮助菜单
-        tk.Button(
+            highlightthickness=0,
+            cursor='hand2',
+            padx=8,
+            pady=5
+        ).pack(side='left', padx=2, pady=6)
+
+        self.help_button = self.create_round_button(
             self.menu_bar,
             text="帮助",
             command=self.show_help,
-            relief=tk.FLAT,
-            padx=8,
-            pady=3
-        ).pack(side='left')
+            variant='ghost'
+        )
+        self.help_button.pack(side='left', padx=2, pady=6)
 
         ttk.Separator(self.menu_bar, orient=tk.VERTICAL).pack(
-            side='left', fill='y', padx=6, pady=3
+            side='left', fill='y', padx=10, pady=8
         )
 
         # 搜索控件
-        tk.Label(self.menu_bar, text="搜索：").pack(side='left')
-        self.search_entry = tk.Entry(
-            self.menu_bar, textvariable=self.search_query, width=32
-        )
-        self.search_entry.pack(side='left', padx=(0, 5), pady=3)
-        self.search_entry.bind('<Return>', lambda event: self.start_search())
-
-        self.search_button = tk.Button(
-            self.menu_bar, text="搜索", command=self.start_search, padx=10
-        )
-        self.search_button.pack(side='left', padx=(0, 4), pady=2)
-
-        self.stop_search_button = tk.Button(
+        tk.Label(
             self.menu_bar,
-            text="停止搜索",
-            command=self.stop_search,
-            state=tk.DISABLED,
-            padx=10
+            text="搜索",
+            bg=self.COLORS['surface'],
+            fg=self.COLORS['text_muted'],
+            font=self.FONTS['medium']
+        ).pack(side='left', padx=(0, 7))
+
+        self.search_entry_shell, self.search_entry = (
+            self.create_rounded_entry(
+                self.menu_bar,
+                textvariable=self.search_query,
+                width=32
+            )
         )
-        self.stop_search_button.pack(side='left', padx=(0, 6), pady=2)
+        self.search_entry_shell.pack(side='left', padx=(0, 6), pady=6)
+        self.search_entry.bind(
+            '<Return>', self.activate_search_from_entry
+        )
+        self.search_entry.bind(
+            '<KP_Enter>', self.activate_search_from_entry
+        )
+        self.isolate_search_keyboard_input(self.search_entry)
+
+        self.search_button = self.create_round_button(
+            self.menu_bar,
+            text="搜索",
+            command=self.start_search,
+            variant='primary'
+        )
+        self.search_button.pack(side='left', padx=(0, 5), pady=6)
+
+        self.stop_search_button = self.create_round_button(
+            self.menu_bar,
+            text="停止",
+            command=self.stop_search,
+            variant='secondary',
+            state=tk.DISABLED
+        )
+        self.stop_search_button.pack(side='left', padx=(0, 7), pady=6)
 
         tk.Checkbutton(
             self.menu_bar,
             text="搜索子文件夹",
             variable=self.search_subfolders,
-            relief=tk.FLAT
-        ).pack(side='left', padx=(0, 6))
-        
-        # 更新收藏夹菜单
+            bg=self.COLORS['surface'],
+            fg=self.COLORS['text_muted'],
+            activebackground=self.COLORS['surface'],
+            activeforeground=self.COLORS['primary_dark'],
+            selectcolor=self.COLORS['primary_soft'],
+            relief=tk.FLAT,
+            highlightthickness=0,
+            cursor='hand2',
+            padx=4,
+            pady=5
+        ).pack(side='left', padx=(0, 8), pady=6)
+
         self.update_favorites_menu()
 
     def get_current_search_directory(self):
@@ -543,6 +1288,7 @@ class ImageViewer:
         if not window_exists:
             self.search_results_window = tk.Toplevel(self.root)
             self.search_results_window.title("搜索结果")
+            self.style_dialog(self.search_results_window)
             saved_width, saved_height = self.get_saved_search_window_size()
             saved_x, saved_y = self.get_saved_search_window_position(
                 saved_width, saved_height
@@ -562,12 +1308,17 @@ class ImageViewer:
                 self.search_results_window,
                 anchor='w',
                 justify='left',
-                padx=8,
-                pady=7
+                bg=self.COLORS['surface'],
+                fg=self.COLORS['text'],
+                font=self.FONTS['title'],
+                padx=12,
+                pady=10
             )
             self.search_root_label.pack(fill='x')
 
-            result_frame = tk.Frame(self.search_results_window)
+            result_frame = tk.Frame(
+                self.search_results_window, bg=self.COLORS['background']
+            )
             result_frame.pack(fill='both', expand=True, padx=8)
 
             vertical_scrollbar = tk.Scrollbar(result_frame, orient='vertical')
@@ -579,7 +1330,17 @@ class ImageViewer:
                 result_frame,
                 selectmode=tk.SINGLE,
                 yscrollcommand=vertical_scrollbar.set,
-                xscrollcommand=horizontal_scrollbar.set
+                xscrollcommand=horizontal_scrollbar.set,
+                bg=self.COLORS['surface'],
+                fg=self.COLORS['text'],
+                selectbackground=self.COLORS['selection'],
+                selectforeground=self.COLORS['primary_dark'],
+                highlightthickness=1,
+                highlightbackground=self.COLORS['border'],
+                relief=tk.FLAT,
+                borderwidth=0,
+                activestyle='none',
+                font=self.FONTS['normal']
             )
             self.search_results_listbox.pack(fill='both', expand=True)
             vertical_scrollbar.configure(command=self.search_results_listbox.yview)
@@ -592,8 +1353,11 @@ class ImageViewer:
                 self.search_results_window,
                 textvariable=self.search_status,
                 anchor='w',
-                padx=8,
-                pady=7
+                bg=self.COLORS['surface_alt'],
+                fg=self.COLORS['text_muted'],
+                font=self.FONTS['small'],
+                padx=12,
+                pady=8
             ).pack(fill='x')
         else:
             self.search_results_window.deiconify()
@@ -729,11 +1493,20 @@ class ImageViewer:
         """显示定时消息对话框"""
         dialog = tk.Toplevel(self.root)
         dialog.title("提示")
-        dialog.geometry("300x100")
+        dialog.geometry("340x120")
         dialog.transient(self.root)
-        
-        label = tk.Label(dialog, text=message, pady=20)
-        label.pack()
+        self.style_dialog(dialog)
+
+        label = tk.Label(
+            dialog,
+            text=message,
+            bg=self.COLORS['surface'],
+            fg=self.COLORS['text'],
+            font=self.FONTS['title'],
+            padx=20,
+            pady=24
+        )
+        label.pack(fill='both', expand=True, padx=12, pady=12)
         
         def close_dialog():
             time.sleep(seconds)
@@ -1129,6 +1902,8 @@ class ImageViewer:
 
     def show_image(self):
         if not self.current_image:
+            self.canvas.delete("all")
+            self.draw_canvas_gradient()
             return
 
         canvas_height = self.canvas.winfo_height()
@@ -1182,9 +1957,11 @@ class ImageViewer:
                                 canvas_height, generation):
         """单页图片也交给后台缩放，避免大宽图阻塞主线程。"""
         total_width = max(width, 1)
+        background_height = max(canvas_height, height)
         self.canvas.config(
-            scrollregion=(0, 0, total_width, max(canvas_height, height))
+            scrollregion=(0, 0, total_width, background_height)
         )
+        self.draw_canvas_gradient(total_width, background_height)
         self.lazy_render_context = {
             'generation': generation,
             'source_image': source_image,
@@ -1205,8 +1982,8 @@ class ImageViewer:
             min(width, max(100, self.canvas.winfo_width())) / 2,
             min(height, canvas_height) / 2,
             text="正在生成图片……",
-            fill='#7f8c8d',
-            font=('Arial', 11)
+            fill=self.COLORS['text_muted'],
+            font=self.FONTS['normal']
         )
 
     def split_image(self, source_image, width, height,
@@ -1218,6 +1995,7 @@ class ImageViewer:
         page_width = width + 20
         total_width = page_width * num_pages
         self.canvas.config(scrollregion=(0, 0, total_width, canvas_height))
+        self.draw_canvas_gradient(total_width, canvas_height)
 
         self.lazy_render_context = {
             'generation': generation,
@@ -1235,7 +2013,7 @@ class ImageViewer:
 
         mask_photo = None
         if self.show_mask.get() and overlap > 0:
-            mask_color = (144, 238, 144, 25)
+            mask_color = (15, 159, 145, 32)
             mask_image = Image.new('RGBA', (width, overlap), mask_color)
             mask_photo = ImageTk.PhotoImage(mask_image)
             self.photo_images.append(mask_photo)
@@ -1244,23 +2022,27 @@ class ImageViewer:
             x = i * page_width + 10
             border_x = x - 5
 
-            self.canvas.create_rectangle(
+            draw_rounded_rectangle(
+                self.canvas,
                 border_x, 5,
                 border_x + width + 10, canvas_height - 5,
-                outline='#4a90e2', width=2, dash=None
+                radius=10,
+                fill='',
+                outline=self.COLORS['border_strong'],
+                width=1
             )
             self.canvas.create_line(
                 border_x + 1, 6, border_x + width + 9, 6,
-                fill='#2c3e50', width=1
+                fill=self.COLORS['border'], width=1
             )
             self.canvas.create_line(
                 border_x + 1, 6, border_x + 1, canvas_height - 6,
-                fill='#2c3e50', width=1
+                fill=self.COLORS['border'], width=1
             )
             self.canvas.create_line(
                 border_x + 1, canvas_height - 6,
                 border_x + width + 9, canvas_height - 6,
-                fill='#2c3e50', width=1
+                fill=self.COLORS['border'], width=1
             )
 
             self.lazy_page_items[i] = self.canvas.create_image(
@@ -1287,18 +2069,18 @@ class ImageViewer:
                 self.canvas.create_line(
                     x, canvas_height - overlap + 10,
                     x + width, canvas_height - overlap + 10,
-                    fill='red', width=1
+                    fill=self.COLORS['overlap_line'], width=2
                 )
             else:
                 self.canvas.create_line(
                     x, overlap + 10, x + width, overlap + 10,
-                    fill='red', width=1
+                    fill=self.COLORS['overlap_line'], width=2
                 )
                 if i < num_pages - 1:
                     self.canvas.create_line(
                         x, canvas_height - overlap + 10,
                         x + width, canvas_height - overlap + 10,
-                        fill='red', width=1
+                        fill=self.COLORS['overlap_line'], width=2
                     )
 
             self.canvas.create_text(
@@ -1306,15 +2088,15 @@ class ImageViewer:
                 canvas_height - 20,
                 text=(f"第 {i + 1}/{num_pages} 页 "
                       f"(重叠: {int(self.overlap_ratio * 100)}%)"),
-                fill='#4a90e2',
-                font=('Arial', 10)
+                fill=self.COLORS['primary'],
+                font=self.FONTS['small']
             )
             self.lazy_page_placeholders[i] = self.canvas.create_text(
                 x + min(width, max(100, self.canvas.winfo_width())) / 2,
                 canvas_height / 2,
                 text=f"正在生成第 {i + 1} 页……",
-                fill='#7f8c8d',
-                font=('Arial', 11)
+                fill=self.COLORS['text_muted'],
+                font=self.FONTS['normal']
             )
 
     def on_horizontal_scroll(self, *args):
@@ -1497,13 +2279,17 @@ class ImageViewer:
         if hasattr(self, 'current_file_path'):
             self.save_image_config(self.current_file_path)
 
-    def zoom_in(self, event):
+    def zoom_in(self, event=None):
+        if self.is_text_input_focused():
+            return 'break'
         if not self.current_image:
             return
         self.scale += 0.1
         self.schedule_zoom_render()
 
-    def zoom_out(self, event):
+    def zoom_out(self, event=None):
+        if self.is_text_input_focused():
+            return 'break'
         if not self.current_image:
             return
         self.scale = max(0.1, self.scale - 0.1)
@@ -1748,101 +2534,126 @@ class ImageViewer:
             self.update_favorites_menu()
     
     def show_favorites_manager(self):
-        """显示藏夹管理窗口"""
+        """显示收藏夹管理窗口。"""
         dialog = tk.Toplevel(self.root)
         dialog.title("收藏夹整理")
-        dialog.geometry("500x400")
         dialog.transient(self.root)
         dialog.grab_set()
-        
-        # 尝试��注册表加载位置
+        self.style_dialog(dialog)
+
+        dialog_width = self.FAVORITES_DIALOG_SIZE['width']
+        dialog_height = self.FAVORITES_DIALOG_SIZE['height']
+        x = max(0, (self.root.winfo_screenwidth() - dialog_width) // 2)
+        y = max(0, (self.root.winfo_screenheight() - dialog_height) // 2)
+
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.REG_KEYS['PATH'], 0,
-                                winreg.KEY_READ)
-            pos = json.loads(winreg.QueryValueEx(key, self.REG_KEYS['FAVORITES_POS'])[0])
-            winreg.CloseKey(key)
-            
-            # 检查位置是否有效
-            screen_width = self.root.winfo_screenwidth()
-            screen_height = self.root.winfo_screenheight()
-            dialog_width = 500
-            dialog_height = 400
-            
-            # 如果位置会导致窗口超出屏幕范围，则使用默认中心位置
-            if (pos['x'] < 0 or pos['x'] + dialog_width > screen_width or
-                pos['y'] < 0 or pos['y'] + dialog_height > screen_height):
+            config = self.load_config()
+            saved_position = config.get(
+                self.CONFIG_KEYS['FAVORITES_POS'], ''
+            )
+            if saved_position:
+                position = json.loads(saved_position)
+                x = int(position['x'])
+                y = int(position['y'])
+
+            desktop_x, desktop_y, desktop_width, desktop_height = (
+                self.get_desktop_bounds()
+            )
+            if (x < desktop_x or y < desktop_y or
+                    x + dialog_width > desktop_x + desktop_width or
+                    y + dialog_height > desktop_y + desktop_height):
                 raise ValueError("Position out of screen")
-            
-            # 设置位置
-            dialog.geometry(f"+{pos['x']}+{pos['y']}")
-        except (WindowsError, ValueError, json.JSONDecodeError):
-            # 果没有保存位置或位置无效，居中显示
-            dialog_width = 500
-            dialog_height = 400
-            x = (self.root.winfo_screenwidth() - dialog_width) // 2
-            y = (self.root.winfo_screenheight() - dialog_height) // 2
-            dialog.geometry(f"+{x}+{y}")
-        
-        # 创建列表框
-        listbox = tk.Listbox(dialog, selectmode=tk.SINGLE)
-        listbox.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # 获取收藏列表
+        except (KeyError, TypeError, ValueError):
+            x = max(0, (self.root.winfo_screenwidth() - dialog_width) // 2)
+            y = max(0, (self.root.winfo_screenheight() - dialog_height) // 2)
+
+        dialog.geometry(f"{dialog_width}x{dialog_height}{x:+d}{y:+d}")
+
+        listbox = tk.Listbox(
+            dialog,
+            selectmode=tk.SINGLE,
+            exportselection=False,
+            bg=self.COLORS['surface'],
+            fg=self.COLORS['text'],
+            selectbackground=self.COLORS['selection'],
+            selectforeground=self.COLORS['primary_dark'],
+            highlightthickness=1,
+            highlightbackground=self.COLORS['border'],
+            relief=tk.FLAT,
+            borderwidth=0,
+            activestyle='none',
+            font=self.FONTS['normal']
+        )
+        listbox.pack(fill='both', expand=True, padx=12, pady=(12, 8))
+
         favorites = self.get_favorites()
-        
-        # 填充列表
         for path in favorites:
             display_name = os.path.basename(path) or path
             icon = "📁" if os.path.isdir(path) else "📄"
             listbox.insert(tk.END, f"{icon} {display_name} ({path})")
-        
-        # 创建按钮框架
-        button_frame = tk.Frame(dialog)
-        button_frame.pack(fill='x', padx=5, pady=5)
-        
-        # 左侧按钮框架
-        left_buttons = tk.Frame(button_frame)
+
+        button_frame = tk.Frame(dialog, bg=self.COLORS['background'])
+        button_frame.pack(fill='x', padx=12, pady=(0, 12))
+
+        left_buttons = tk.Frame(
+            button_frame, bg=self.COLORS['background']
+        )
         left_buttons.pack(side='left')
-        
-        # 上移按钮
-        tk.Button(left_buttons, text="上移",
-                 command=lambda: self.move_favorite(listbox, -1)).pack(side='left')
-        
-        # 下移钮
-        tk.Button(left_buttons, text="下移",
-                 command=lambda: self.move_favorite(listbox, 1)).pack(side='left')
-        
-        # 删除按钮
-        tk.Button(left_buttons, text="删除",
-                 command=lambda: self.delete_favorite(listbox)).pack(side='left')
-        
-        # 部删除钮
-        tk.Button(left_buttons, text="全部删除",
-                 command=lambda: self.delete_all_favorites(listbox)).pack(side='left')
-        
-        # 检查失效项目按钮
-        tk.Button(left_buttons, text="检查失效项目",
-                 command=lambda: self.check_invalid_favorites(listbox)).pack(side='left')
-        
-        # 确定按钮 - 设置宽度为原来的2
-        tk.Button(button_frame, text="确定", width=16,  # 设置宽度
-                 command=lambda: self.save_favorites_order(listbox, dialog)).pack(side='right', padx=5)
-        
-        # 保存窗口位置
+
+        self.create_round_button(
+            left_buttons,
+            text="上移",
+            command=lambda: self.move_favorite(listbox, -1),
+            variant='secondary'
+        ).pack(side='left', padx=(0, 6))
+        self.create_round_button(
+            left_buttons,
+            text="下移",
+            command=lambda: self.move_favorite(listbox, 1),
+            variant='secondary'
+        ).pack(side='left', padx=(0, 6))
+        self.create_round_button(
+            left_buttons,
+            text="删除",
+            command=lambda: self.delete_favorite(listbox),
+            variant='danger'
+        ).pack(side='left', padx=(0, 6))
+        self.create_round_button(
+            left_buttons,
+            text="全部删除",
+            command=lambda: self.delete_all_favorites(listbox),
+            variant='danger'
+        ).pack(side='left', padx=(0, 6))
+        self.create_round_button(
+            left_buttons,
+            text="检查失效项目",
+            command=lambda: self.check_invalid_favorites(listbox),
+            variant='secondary'
+        ).pack(side='left')
+
+        self.create_round_button(
+            button_frame,
+            text="确定",
+            width=10,
+            command=lambda: self.save_favorites_order(listbox, dialog),
+            variant='primary'
+        ).pack(side='right', padx=(10, 0))
+
         def save_position():
             try:
-                key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.REG_KEYS['PATH'], 0,
-                                       winreg.KEY_WRITE)
                 pos = {'x': dialog.winfo_x(), 'y': dialog.winfo_y()}
-                winreg.SetValueEx(key, self.REG_KEYS['FAVORITES_POS'], 0, winreg.REG_SZ,
-                                json.dumps(pos))
-                winreg.CloseKey(key)
-            except WindowsError as e:
-                print(f"无法保窗口位置: {e}")
-        
-        # 在口关闭时保存位置
-        dialog.bind("<Configure>", lambda e: save_position() if e.widget == dialog else None)
-    
+                self.save_config(
+                    self.CONFIG_KEYS['FAVORITES_POS'],
+                    json.dumps(pos)
+                )
+            except tk.TclError as e:
+                print(f"无法保存窗口位置: {e}")
+
+        dialog.bind(
+            "<Configure>",
+            lambda event: save_position() if event.widget == dialog else None
+        )
+
     def move_favorite(self, listbox, direction):
         """移动收藏项目"""
         selection = listbox.curselection()
@@ -2013,9 +2824,9 @@ class ImageViewer:
         help_text = """
 本软件用于浏览较长的乐谱，它可将长乐谱切分为数个页面并显示，方便演奏者在不用翻页或尽量少翻页的情况下进行演奏。本软件也可用于浏览其他类型的长图，在超宽显示器上具有更好的效果。详细功能介绍如下：
 
-1. 自动将超长图片切分为数个页面，并排显示。每个页面之间存在一定的重叠内容，重叠部分使用红线进行了标识。
+1. 自动将超长图片切分为数个页面，并排显示。每个页面之间存在一定的重叠内容，重叠部分使用橙色引导线进行标识。
 
-2. 按下鼠标中键（滚轮）或点击菜单栏"遮罩"选项，可以为重叠部分增加绿色半透明遮罩，让重叠部分更加显眼，方便演奏者定位。
+2. 按下鼠标中键（滚轮）或点击菜单栏"遮罩"选项，可以为重叠部分增加青绿色半透明遮罩，让重叠部分更加显眼，方便演奏者定位。
 
 3. 按下小键盘上的+和-按键，可以放大或缩小图片。图片被放大或缩小后，切分页面数量会产生变化。
 
@@ -2038,24 +2849,46 @@ class ImageViewer:
         
         dialog = tk.Toplevel(self.root)
         dialog.title("帮助")
-        dialog.geometry("550x650")
+        dialog.geometry("620x700")
         dialog.resizable(False, True)  # 只允许垂直方向调整大小
         dialog.transient(self.root)
         dialog.grab_set()
+        self.style_dialog(dialog)
         
         # 创建主框架
-        main_frame = tk.Frame(dialog)
+        main_frame = tk.Frame(
+            dialog, bg=self.COLORS['background']
+        )
         main_frame.pack(fill='both', expand=True)
         
         # 创建文本框和滚动条
-        text_frame = tk.Frame(main_frame)
-        text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        text_frame = tk.Frame(
+            main_frame, bg=self.COLORS['background']
+        )
+        text_frame.pack(fill='both', expand=True, padx=14, pady=14)
         
         scrollbar = tk.Scrollbar(text_frame)
         scrollbar.pack(side='right', fill='y')
         
-        text = tk.Text(text_frame, wrap='word', yscrollcommand=scrollbar.set, 
-                      font=('Microsoft YaHei', 10))  # 使用微软雅黑字体
+        text = tk.Text(
+            text_frame,
+            wrap='word',
+            yscrollcommand=scrollbar.set,
+            bg=self.COLORS['surface'],
+            fg=self.COLORS['text'],
+            selectbackground=self.COLORS['selection'],
+            selectforeground=self.COLORS['primary_dark'],
+            insertbackground=self.COLORS['primary'],
+            highlightthickness=1,
+            highlightbackground=self.COLORS['border'],
+            relief=tk.FLAT,
+            borderwidth=0,
+            font=self.FONTS['normal'],
+            padx=14,
+            pady=12,
+            spacing1=3,
+            spacing3=5
+        )
         text.pack(side='left', fill='both', expand=True)
         
         scrollbar.config(command=text.yview)
@@ -2065,12 +2898,19 @@ class ImageViewer:
         text.config(state='disabled')  # 设置为只读
         
         # 创建底部的确定按钮框架
-        button_frame = tk.Frame(main_frame)
-        button_frame.pack(fill='x', padx=10, pady=(0, 10))
+        button_frame = tk.Frame(
+            main_frame, bg=self.COLORS['background']
+        )
+        button_frame.pack(fill='x', padx=14, pady=(0, 14))
         
         # 添加确定按钮
-        ok_button = tk.Button(button_frame, text="确定", width=10, 
-                             command=dialog.destroy)
+        ok_button = self.create_round_button(
+            button_frame,
+            text="确定",
+            width=10,
+            command=dialog.destroy,
+            variant='primary'
+        )
         ok_button.pack(side='right')
         
         # 居中显示窗口
