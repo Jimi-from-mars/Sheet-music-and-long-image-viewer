@@ -1,0 +1,18 @@
+[package]
+name = "split-image-viewer"
+version = "2.0.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "pnm", "tga", "dds", "hdr", "qoi"] }
+serde_json = "1"
+walkdir = "2"
+chrono = "0.4"
+unicode-casefold = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

@@ -1,0 +1,10 @@
+/target/
+/.build/
+/.cargo/split-image-dlltool.exe
+/validation/unit/
+/validation/v1_2/image-inventory.json
+/setup.ini
+/image_config.json
+*.exe
+__pycache__/
+*.pyc

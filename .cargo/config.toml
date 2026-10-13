@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = '.cargo/linker.cmd'
+rustflags = ["-C", "target-feature=+crt-static", "-C", "dlltool=split-image-dlltool.exe"]
